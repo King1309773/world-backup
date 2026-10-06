@@ -92,10 +92,6 @@ public final class SnapshotScanner {
                     throws IOException {
                 cancellation.check();
                 String relativePath = portableRelativePath(resolvedRoot, file);
-                if ("session.lock".equals(relativePath)) {
-                    return FileVisitResult.CONTINUE;
-                }
-
                 Path contentPath = file;
                 BasicFileAttributes contentAttributes = attributes;
                 if (attributes.isSymbolicLink()) {
@@ -107,6 +103,9 @@ public final class SnapshotScanner {
                     }
                     contentAttributes = Files.readAttributes(contentPath,
                         BasicFileAttributes.class);
+                }
+                if ("session.lock".equals(relativePath)) {
+                    return FileVisitResult.CONTINUE;
                 }
                 if (exclusion != null && exclusion.test(relativePath)) {
                     return FileVisitResult.CONTINUE;

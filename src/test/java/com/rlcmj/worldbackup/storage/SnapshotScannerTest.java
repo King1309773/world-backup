@@ -63,6 +63,33 @@ public class SnapshotScannerTest {
     }
 
     @Test
+    public void rejectsRootSessionLockSymlinkEscapingWorld() throws Exception {
+        Path world = temp.newFolder("escaping-session-lock-world").toPath();
+        Path outside = temp.newFile("outside-session-lock.dat").toPath();
+        Path sessionLock = world.resolve("session.lock");
+        createSymbolicLinkOrSkip(sessionLock, outside);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> scan(world));
+
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
+        assertEquals("session.lock", error.getArguments()[0]);
+    }
+
+    @Test
+    public void excludesRootSessionLockSymlinkWhoseTargetIsInsideWorld() throws Exception {
+        Path world = temp.newFolder("inside-session-lock-world").toPath();
+        Path target = write(world.resolve("actual-lock.dat"), "inside");
+        Path sessionLock = world.resolve("session.lock");
+        createSymbolicLinkOrSkip(sessionLock, target.getFileName());
+
+        SnapshotManifest manifest = scan(world);
+
+        assertTrue(manifest.getFiles().containsKey("actual-lock.dat"));
+        assertFalse(manifest.getFiles().containsKey("session.lock"));
+    }
+
+    @Test
     public void computesKnownLowercaseSha256OnFirstScan() throws Exception {
         Path world = temp.newFolder("hash-world").toPath();
         write(world.resolve("level.dat"), "hello");
