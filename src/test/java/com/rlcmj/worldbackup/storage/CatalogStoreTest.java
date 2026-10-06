@@ -61,6 +61,61 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void rejectsLenientJsonDuplicateFieldsAndTrailingContent() throws Exception {
+        Path repo = temp.newFolder("strict-json").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String json : Arrays.asList(
+            "{/*comment*/\"formatVersion\":1,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[]}",
+            "{'formatVersion':1,'worldId':'World1','displayName':'World','versions':[]}",
+            "{formatVersion:1,worldId:\"World1\",displayName:\"World\",versions:[]}",
+            "{\"formatVersion\":1,\"formatVersion\":1,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[]}",
+            valid.replace("\"id\":\"v1\"", "\"id\":\"v1\",\"id\":\"v2\""),
+            valid + " true",
+            "{\"formatVersion\":1,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[],}",
+            "{\"formatVersion\":NaN,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[]}",
+            "{\"formatVersion\":Infinity,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[]}"
+        )) {
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupException error = assertThrows("Expected strict JSON rejection for " + json,
+                BackupException.class, () -> new CatalogStore().load(repo));
+
+            assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void ignoresUnknownFieldsInCurrentCatalogVersion() throws Exception {
+        Path repo = temp.newFolder("unknown-fields").toPath();
+        String json = fullyPopulatedCatalogJson()
+            .replace("\"worldId\":\"World1\"", "\"unknown\":{\"nested\":true},"
+                + "\"worldId\":\"World1\"")
+            .replace("\"id\":\"v1\"", "\"futureValue\":17,\"id\":\"v1\"");
+        Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+        BackupCatalog loaded = new CatalogStore().load(repo);
+
+        assertEquals("World1", loaded.getWorldId());
+        assertEquals(1, loaded.getVersions().size());
+    }
+
+    @Test
+    public void missingCatalogIsReportedAsReadFailure() throws Exception {
+        Path repo = temp.newFolder("missing-catalog").toPath();
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new CatalogStore().load(repo));
+
+        assertEquals("worldbackup.error.catalog_read", error.getTranslationKey());
+        assertTrue(error.getCause() instanceof IOException);
+    }
+
+    @Test
     public void rejectsUnsupportedCatalogVersion() throws Exception {
         Path repo = temp.newFolder("unsupported").toPath();
         Files.write(repo.resolve("index.json"),
@@ -189,6 +244,21 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void successfulNonAtomicFallbackReplacesTargetAndCleansArtifacts() throws Exception {
+        Path directory = temp.newFolder("fallback-success").toPath();
+        Path target = directory.resolve("index.json");
+        Files.write(target, "old".getBytes(StandardCharsets.UTF_8));
+
+        AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)),
+            atomicMoveUnsupported());
+
+        assertEquals("new", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(directory.resolve("index.json.tmp")));
+        assertFalse(Files.exists(directory.resolve("index.json.bak")));
+    }
+
+    @Test
     public void failedNonAtomicFallbackLeavesNewTargetAbsent() throws Exception {
         Path directory = temp.newFolder("fallback-new-file").toPath();
         Path target = directory.resolve("index.json");
@@ -255,6 +325,16 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void replacementAndRollbackFailurePreserveRecoveryBackup() throws Exception {
+        assertRollbackFailurePreservesBackup("replacement-rollback-failure", true);
+    }
+
+    @Test
+    public void cleanupAndRollbackFailurePreserveRecoveryBackup() throws Exception {
+        assertRollbackFailurePreservesBackup("cleanup-rollback-failure", false);
+    }
+
+    @Test
     public void cancellationThrowsWhenExplicitlyCancelled() {
         BackupCancellation cancellation = new BackupCancellation();
         assertFalse(cancellation.isCancelled());
@@ -284,7 +364,7 @@ public class CatalogStoreTest {
         FileFingerprint second = new FileFingerprint(3L, 4L, "two");
 
         manifest.put("z.dat", first);
-        manifest.put("data\\.\\level.dat", second);
+        manifest.put("data\\level.dat", second);
 
         assertEquals(Arrays.asList("z.dat", "data/level.dat"),
             new ArrayList<>(manifest.getFiles().keySet()));
@@ -297,11 +377,145 @@ public class CatalogStoreTest {
         FileFingerprint fingerprint = new FileFingerprint(1L, 2L, "hash");
 
         for (String path : Arrays.asList("../level.dat", "data/../level.dat", "/level.dat",
-            "C:level.dat", "C:/level.dat", "C:\\level.dat", "\\\\server\\level.dat")) {
+            "C:level.dat", "C:/level.dat", "C:\\level.dat", "\\\\server\\level.dat",
+            "data//level.dat", "data/./level.dat", "data/\u0000.dat", "foo:bar",
+            "region/NUL", "level.dat.", "level.dat ", "region/CON.txt", "COM1.log")) {
             assertThrows("Expected unsafe path rejection for " + path,
                 IllegalArgumentException.class, () -> manifest.put(path, fingerprint));
         }
         assertTrue(manifest.getFiles().isEmpty());
+    }
+
+    @Test
+    public void versionRejectsUnsafeArchiveBasenames() {
+        for (String archiveName : Arrays.asList("../../outside.zip", "dir/archive.zip",
+            "dir\\archive.zip", "bad\u0000.zip", "foo:bar.zip", "NUL.zip", "archive.zip.",
+            "archive.zip ")) {
+            assertThrows("Expected unsafe archive rejection for " + archiveName,
+                IllegalArgumentException.class, () -> BackupVersion.full("v1", 1L,
+                    BackupTrigger.MANUAL, archiveName, 0L, 0L, 0L,
+                    new SnapshotManifest()));
+        }
+    }
+
+    @Test
+    public void rejectsUnsafeArchiveNameFromCatalog() throws Exception {
+        Path repo = temp.newFolder("unsafe-archive-catalog").toPath();
+        String json = fullyPopulatedCatalogJson().replace("v1.zip", "../../outside.zip");
+        Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new CatalogStore().load(repo));
+
+        assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+    }
+
+    @Test
+    public void rejectsUnsafeManifestPathsFromCatalog() throws Exception {
+        Path repo = temp.newFolder("unsafe-manifest-catalog").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String json : Arrays.asList(
+            valid.replace("\"level.dat\"", "\"region/NUL\""),
+            valid.replace("\"level.dat\"", "\"region/foo:bar\""),
+            valid.replace("\"level.dat\"", "\"trailing.\""),
+            valid.replace("\"level.dat\"", "\"bad\\u0000name\"")
+        )) {
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupException error = assertThrows(BackupException.class,
+                () -> new CatalogStore().load(repo));
+
+            assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void constructorsRejectBlankTextAndNegativeSizesOrDurations() {
+        SnapshotManifest manifest = new SnapshotManifest();
+
+        assertThrows(IllegalArgumentException.class,
+            () -> BackupCatalog.empty(" ", "World"));
+        assertThrows(IllegalArgumentException.class,
+            () -> BackupCatalog.empty("World1", "\t"));
+        assertThrows(IllegalArgumentException.class,
+            () -> new FileFingerprint(-1L, -10L, "hash"));
+        assertThrows(IllegalArgumentException.class,
+            () -> new FileFingerprint(0L, -10L, " "));
+        assertEquals(-10L, new FileFingerprint(0L, -10L, "hash").getModifiedTimeMillis());
+
+        assertThrows(IllegalArgumentException.class, () -> BackupVersion.full(" ", 1L,
+            BackupTrigger.MANUAL, "v1.zip", 0L, 0L, 0L, manifest));
+        assertThrows(IllegalArgumentException.class, () -> BackupVersion.full("v1", -1L,
+            BackupTrigger.MANUAL, "v1.zip", 0L, 0L, 0L, manifest));
+        assertThrows(IllegalArgumentException.class, () -> BackupVersion.full("v1", 1L,
+            BackupTrigger.MANUAL, "v1.zip", -1L, 0L, 0L, manifest));
+        assertThrows(IllegalArgumentException.class, () -> BackupVersion.full("v1", 1L,
+            BackupTrigger.MANUAL, "v1.zip", 0L, -1L, 0L, manifest));
+        assertThrows(IllegalArgumentException.class, () -> BackupVersion.full("v1", 1L,
+            BackupTrigger.MANUAL, "v1.zip", 0L, 0L, -1L, manifest));
+        assertThrows(IllegalArgumentException.class, () -> new BackupVersion("v1", 1L,
+            BackupTrigger.MANUAL, com.rlcmj.worldbackup.core.BackupMode.INCREMENTAL,
+            "v1.zip", " ", "base", true, 0L, 0L, 0L, manifest,
+            Arrays.asList("level.dat"), Arrays.asList("old.dat")));
+    }
+
+    @Test
+    public void rejectsInvalidLoadedCatalogValueSemantics() throws Exception {
+        Path repo = temp.newFolder("invalid-catalog-values").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String json : Arrays.asList(
+            valid.replace("\"worldId\":\"World1\"", "\"worldId\":\" \""),
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\" \""),
+            valid.replace("\"id\":\"v1\"", "\"id\":\" \""),
+            valid.replace("\"archiveName\":\"v1.zip\"", "\"archiveName\":\" \""),
+            valid.replace("\"parentId\":null", "\"parentId\":\" \""),
+            valid.replace("\"baseId\":null", "\"baseId\":\" \""),
+            valid.replace("\"createdAt\":1", "\"createdAt\":-1"),
+            valid.replace("\"originalBytes\":2", "\"originalBytes\":-2"),
+            valid.replace("\"archiveBytes\":3", "\"archiveBytes\":-3"),
+            valid.replace("\"durationMillis\":4", "\"durationMillis\":-4"),
+            valid.replace("\"size\":12", "\"size\":-12"),
+            valid.replace("\"sha256\":\"abc\"", "\"sha256\":\" \"")
+        )) {
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupException error = assertThrows(BackupException.class,
+                () -> new CatalogStore().load(repo));
+
+            assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void rejectsNonIntegralOrOutOfRangeLongNumbers() throws Exception {
+        Path repo = temp.newFolder("invalid-long-numbers").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String json : Arrays.asList(
+            valid.replace("\"createdAt\":1", "\"createdAt\":1e0"),
+            valid.replace("\"size\":12", "\"size\":12.0"),
+            valid.replace("\"originalBytes\":2",
+                "\"originalBytes\":9223372036854775808")
+        )) {
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupException error = assertThrows(BackupException.class,
+                () -> new CatalogStore().load(repo));
+
+            assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void acceptsPreEpochModifiedTimeFromCatalog() throws Exception {
+        Path repo = temp.newFolder("pre-epoch-modified-time").toPath();
+        String json = fullyPopulatedCatalogJson()
+            .replace("\"modifiedTimeMillis\":34", "\"modifiedTimeMillis\":-34");
+        Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+        BackupCatalog loaded = new CatalogStore().load(repo);
+
+        assertEquals(-34L, loaded.getVersions().get(0).getManifest()
+            .get("level.dat").getModifiedTimeMillis());
     }
 
     @Test
@@ -399,6 +613,98 @@ public class CatalogStoreTest {
                 return Files.deleteIfExists(path);
             }
         };
+    }
+
+    private static AtomicFiles.FileOperations atomicMoveUnsupported() {
+        return new AtomicFiles.FileOperations() {
+            @Override
+            public void move(Path source, Path destination, CopyOption... options)
+                    throws IOException {
+                if (Arrays.asList(options).contains(java.nio.file.StandardCopyOption.ATOMIC_MOVE)) {
+                    throw new AtomicMoveNotSupportedException(source.toString(),
+                        destination.toString(), "simulated");
+                }
+                Files.move(source, destination, options);
+            }
+
+            @Override
+            public void copy(Path source, Path destination, CopyOption... options)
+                    throws IOException {
+                Files.copy(source, destination, options);
+            }
+
+            @Override
+            public boolean exists(Path path) {
+                return Files.exists(path);
+            }
+
+            @Override
+            public boolean deleteIfExists(Path path) throws IOException {
+                return Files.deleteIfExists(path);
+            }
+        };
+    }
+
+    private void assertRollbackFailurePreservesBackup(String directoryName,
+                                                       boolean failReplacement) throws Exception {
+        Path directory = temp.newFolder(directoryName).toPath();
+        Path target = directory.resolve("index.json");
+        Path temporary = directory.resolve("index.json.tmp");
+        Path backup = directory.resolve("index.json.bak");
+        Files.write(target, "old".getBytes(StandardCharsets.UTF_8));
+        IOException primaryFailure = new IOException(failReplacement
+            ? "replacement failed after move" : "backup cleanup failed");
+        IOException rollbackFailure = new IOException("rollback failed");
+        int[] backupDeletes = {0};
+
+        AtomicFiles.FileOperations failures = new AtomicFiles.FileOperations() {
+            @Override
+            public void move(Path source, Path destination, CopyOption... options)
+                    throws IOException {
+                if (Arrays.asList(options).contains(java.nio.file.StandardCopyOption.ATOMIC_MOVE)) {
+                    throw new AtomicMoveNotSupportedException(source.toString(),
+                        destination.toString(), "simulated");
+                }
+                if (source.equals(backup) && destination.equals(target)) {
+                    throw rollbackFailure;
+                }
+                Files.move(source, destination, options);
+                if (failReplacement && source.equals(temporary) && destination.equals(target)) {
+                    throw primaryFailure;
+                }
+            }
+
+            @Override
+            public void copy(Path source, Path destination, CopyOption... options)
+                    throws IOException {
+                Files.copy(source, destination, options);
+            }
+
+            @Override
+            public boolean exists(Path path) {
+                return Files.exists(path);
+            }
+
+            @Override
+            public boolean deleteIfExists(Path path) throws IOException {
+                if (!failReplacement && path.equals(backup) && ++backupDeletes[0] == 2) {
+                    throw primaryFailure;
+                }
+                return Files.deleteIfExists(path);
+            }
+        };
+
+        IOException failure = assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)), failures));
+
+        assertTrue(failure.getMessage().contains(primaryFailure.getMessage()));
+        assertTrue(failure.getMessage().contains(backup.toAbsolutePath().normalize().toString()));
+        assertSame(primaryFailure, failure.getCause());
+        assertEquals(1, failure.getSuppressed().length);
+        assertSame(rollbackFailure, failure.getSuppressed()[0]);
+        assertEquals("old", new String(Files.readAllBytes(backup), StandardCharsets.UTF_8));
+        assertEquals("new", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(temporary));
     }
 
     private static String fullyPopulatedCatalogJson() {

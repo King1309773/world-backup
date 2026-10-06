@@ -4,24 +4,33 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import com.google.gson.stream.MalformedJsonException;
 import com.rlcmj.worldbackup.core.BackupCatalog;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupMode;
 import com.rlcmj.worldbackup.core.BackupTrigger;
 import com.rlcmj.worldbackup.core.BackupVersion;
 import com.rlcmj.worldbackup.core.FileFingerprint;
+import com.rlcmj.worldbackup.core.PortablePaths;
 import com.rlcmj.worldbackup.core.SnapshotManifest;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 public final class CatalogStore {
     private static final String INDEX_NAME = "index.json";
@@ -43,16 +52,127 @@ public final class CatalogStore {
     public BackupCatalog load(Path repository) throws BackupException {
         Path index = repository.resolve(INDEX_NAME);
         try (Reader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
-            JsonElement json = new JsonParser().parse(reader);
-            readFormatVersion(json);
-            validateStructure(json.getAsJsonObject());
-            BackupCatalog catalog = gson.fromJson(json, BackupCatalog.class);
-            validate(catalog);
-            return catalog;
+            try {
+                JsonElement json = readDocument(reader);
+                readFormatVersion(json);
+                validateStructure(json.getAsJsonObject());
+                BackupCatalog catalog = gson.fromJson(json, BackupCatalog.class);
+                validate(catalog);
+                return catalog;
+            } catch (BackupException failure) {
+                throw failure;
+            } catch (RuntimeException failure) {
+                throw new BackupException("worldbackup.error.catalog_corrupt", failure);
+            }
         } catch (BackupException failure) {
             throw failure;
-        } catch (IOException | RuntimeException failure) {
-            throw new BackupException("worldbackup.error.catalog_corrupt", failure);
+        } catch (IOException failure) {
+            throw new BackupException("worldbackup.error.catalog_read", failure);
+        }
+    }
+
+    private static JsonElement readDocument(Reader source) throws IOException {
+        JsonReader reader = new JsonReader(source);
+        reader.setLenient(false);
+        try {
+            JsonElement value = readValue(reader);
+            if (reader.peek() != JsonToken.END_DOCUMENT) {
+                throw new CatalogSyntaxException("Trailing JSON content");
+            }
+            return value;
+        } catch (MalformedJsonException | EOFException | NumberFormatException
+                 | IllegalStateException failure) {
+            throw new CatalogSyntaxException("Invalid JSON", failure);
+        }
+    }
+
+    private static JsonElement readValue(JsonReader reader) throws IOException {
+        JsonToken token = reader.peek();
+        switch (token) {
+            case BEGIN_OBJECT:
+                return readObject(reader);
+            case BEGIN_ARRAY:
+                return readArray(reader);
+            case STRING:
+                return new JsonPrimitive(reader.nextString());
+            case NUMBER:
+                return new JsonPrimitive(new EncodedJsonNumber(reader.nextString()));
+            case BOOLEAN:
+                return new JsonPrimitive(reader.nextBoolean());
+            case NULL:
+                reader.nextNull();
+                return JsonNull.INSTANCE;
+            default:
+                throw new CatalogSyntaxException("Unexpected JSON token: " + token);
+        }
+    }
+
+    private static JsonObject readObject(JsonReader reader) throws IOException {
+        JsonObject object = new JsonObject();
+        Set<String> names = new HashSet<>();
+        reader.beginObject();
+        while (reader.hasNext()) {
+            String name = reader.nextName();
+            if (!names.add(name)) {
+                throw new CatalogSyntaxException("Duplicate JSON field: " + name);
+            }
+            object.add(name, readValue(reader));
+        }
+        reader.endObject();
+        return object;
+    }
+
+    private static JsonArray readArray(JsonReader reader) throws IOException {
+        JsonArray array = new JsonArray();
+        reader.beginArray();
+        while (reader.hasNext()) {
+            array.add(readValue(reader));
+        }
+        reader.endArray();
+        return array;
+    }
+
+    private static final class CatalogSyntaxException extends RuntimeException {
+        CatalogSyntaxException(String message) {
+            super(message);
+        }
+
+        CatalogSyntaxException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    private static final class EncodedJsonNumber extends Number {
+        private static final long serialVersionUID = 1L;
+        private final String encoded;
+
+        EncodedJsonNumber(String encoded) {
+            this.encoded = encoded;
+        }
+
+        @Override
+        public int intValue() {
+            return new BigDecimal(encoded).intValue();
+        }
+
+        @Override
+        public long longValue() {
+            return new BigDecimal(encoded).longValue();
+        }
+
+        @Override
+        public float floatValue() {
+            return Float.parseFloat(encoded);
+        }
+
+        @Override
+        public double doubleValue() {
+            return Double.parseDouble(encoded);
+        }
+
+        @Override
+        public String toString() {
+            return encoded;
         }
     }
 
@@ -205,8 +325,7 @@ public final class CatalogStore {
     private static void validate(BackupCatalog catalog) throws BackupException {
         try {
             if (catalog == null || catalog.getFormatVersion() != BackupCatalog.FORMAT_VERSION
-                || catalog.getWorldId() == null || catalog.getWorldId().isEmpty()
-                || catalog.getDisplayName() == null || catalog.getDisplayName().isEmpty()) {
+                || isBlank(catalog.getWorldId()) || isBlank(catalog.getDisplayName())) {
                 throw corrupt();
             }
             for (BackupVersion version : catalog.getVersions()) {
@@ -220,15 +339,18 @@ public final class CatalogStore {
     }
 
     private static void validate(BackupVersion version) throws BackupException {
-        if (version == null || version.getId() == null || version.getId().isEmpty()
+        if (version == null || isBlank(version.getId())
             || version.getTrigger() == null || version.getMode() == null
-            || version.getArchiveName() == null || version.getArchiveName().isEmpty()
-            || version.getManifest() == null) {
+            || isBlank(version.getArchiveName()) || version.getManifest() == null
+            || isBlankWhenPresent(version.getParentId()) || isBlankWhenPresent(version.getBaseId())
+            || version.getCreatedAt() < 0L || version.getOriginalBytes() < 0L
+            || version.getArchiveBytes() < 0L || version.getDurationMillis() < 0L) {
             throw corrupt();
         }
+        PortablePaths.requireSafeBasename(version.getArchiveName());
         for (Map.Entry<String, FileFingerprint> entry : version.getManifest().getFiles().entrySet()) {
             if (entry.getKey() == null || entry.getValue() == null
-                || entry.getValue().getSha256() == null
+                || isBlank(entry.getValue().getSha256()) || entry.getValue().getSize() < 0L
                 || !entry.getKey().equals(SnapshotManifest.normalizePath(entry.getKey()))) {
                 throw corrupt();
             }
@@ -247,5 +369,13 @@ public final class CatalogStore {
 
     private static BackupException corrupt() {
         return new BackupException("worldbackup.error.catalog_corrupt");
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private static boolean isBlankWhenPresent(String value) {
+        return value != null && value.trim().isEmpty();
     }
 }

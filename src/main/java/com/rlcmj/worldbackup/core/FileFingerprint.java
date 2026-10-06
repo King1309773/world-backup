@@ -10,9 +10,16 @@ public final class FileFingerprint {
     private FileFingerprint() { }
 
     public FileFingerprint(long size, long modifiedTimeMillis, String sha256) {
+        if (size < 0L) {
+            throw new IllegalArgumentException("size must not be negative");
+        }
+        Objects.requireNonNull(sha256, "sha256");
+        if (sha256.trim().isEmpty()) {
+            throw new IllegalArgumentException("sha256 must not be blank");
+        }
         this.size = size;
         this.modifiedTimeMillis = modifiedTimeMillis;
-        this.sha256 = Objects.requireNonNull(sha256, "sha256");
+        this.sha256 = sha256;
     }
 
     public long getSize() {

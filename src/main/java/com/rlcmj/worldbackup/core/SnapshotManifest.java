@@ -1,9 +1,7 @@
 package com.rlcmj.worldbackup.core;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -40,27 +38,7 @@ public final class SnapshotManifest {
     }
 
     public static String normalizePath(String path) {
-        Objects.requireNonNull(path, "path");
-        String portable = path.replace('\\', '/');
-        if (portable.isEmpty() || portable.startsWith("/")
-            || portable.matches("^[A-Za-z]:.*")) {
-            throw new IllegalArgumentException("Path must be relative: " + path);
-        }
-
-        List<String> normalized = new ArrayList<>();
-        for (String segment : portable.split("/", -1)) {
-            if (segment.isEmpty() || ".".equals(segment)) {
-                continue;
-            }
-            if ("..".equals(segment)) {
-                throw new IllegalArgumentException("Path traversal is not allowed: " + path);
-            }
-            normalized.add(segment);
-        }
-        if (normalized.isEmpty()) {
-            throw new IllegalArgumentException("Path must identify a file: " + path);
-        }
-        return String.join("/", normalized);
+        return PortablePaths.normalizeRelativePath(path);
     }
 
     @Override

@@ -110,7 +110,7 @@ public final class AtomicFiles {
                     operations.move(backup, target, StandardCopyOption.REPLACE_EXISTING);
                     backupCreated = false;
                 } catch (IOException rollbackFailure) {
-                    failure.addSuppressed(rollbackFailure);
+                    throw recoveryRequired(failure, rollbackFailure, backup);
                 }
             } else {
                 cleanup(target, failure, operations);
@@ -129,7 +129,7 @@ public final class AtomicFiles {
                     operations.move(backup, target, StandardCopyOption.REPLACE_EXISTING);
                     backupCreated = false;
                 } catch (IOException rollbackFailure) {
-                    failure.addSuppressed(rollbackFailure);
+                    throw recoveryRequired(failure, rollbackFailure, backup);
                 }
                 if (backupCreated) {
                     cleanup(backup, failure, operations);
@@ -145,5 +145,14 @@ public final class AtomicFiles {
         } catch (IOException cleanupFailure) {
             failure.addSuppressed(cleanupFailure);
         }
+    }
+
+    private static IOException recoveryRequired(IOException failure,
+                                                  IOException rollbackFailure, Path backup) {
+        Path recoveryPath = backup.toAbsolutePath().normalize();
+        IOException recovery = new IOException(failure.getMessage()
+            + "; original target is preserved at " + recoveryPath, failure);
+        recovery.addSuppressed(rollbackFailure);
+        return recovery;
     }
 }

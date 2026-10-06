@@ -30,16 +30,16 @@ public final class BackupVersion {
                          SnapshotManifest manifest, Collection<String> changedPaths,
                          Collection<String> deletedPaths) {
         this.id = requireText(id, "id");
-        this.createdAt = createdAt;
+        this.createdAt = requireNonNegative(createdAt, "createdAt");
         this.trigger = Objects.requireNonNull(trigger, "trigger");
         this.mode = Objects.requireNonNull(mode, "mode");
-        this.archiveName = requireText(archiveName, "archiveName");
-        this.parentId = parentId;
-        this.baseId = baseId;
+        this.archiveName = PortablePaths.requireSafeBasename(archiveName);
+        this.parentId = optionalText(parentId, "parentId");
+        this.baseId = optionalText(baseId, "baseId");
         this.visible = visible;
-        this.originalBytes = originalBytes;
-        this.archiveBytes = archiveBytes;
-        this.durationMillis = durationMillis;
+        this.originalBytes = requireNonNegative(originalBytes, "originalBytes");
+        this.archiveBytes = requireNonNegative(archiveBytes, "archiveBytes");
+        this.durationMillis = requireNonNegative(durationMillis, "durationMillis");
         this.manifest = new SnapshotManifest(Objects.requireNonNull(manifest, "manifest"));
         this.changedPaths = normalizePaths(changedPaths, "changedPaths");
         this.deletedPaths = normalizePaths(deletedPaths, "deletedPaths");
@@ -64,8 +64,19 @@ public final class BackupVersion {
 
     private static String requireText(String value, String name) {
         Objects.requireNonNull(value, name);
-        if (value.isEmpty()) {
+        if (value.trim().isEmpty()) {
             throw new IllegalArgumentException(name + " must not be empty");
+        }
+        return value;
+    }
+
+    private static String optionalText(String value, String name) {
+        return value == null ? null : requireText(value, name);
+    }
+
+    private static long requireNonNegative(long value, String name) {
+        if (value < 0L) {
+            throw new IllegalArgumentException(name + " must not be negative");
         }
         return value;
     }
