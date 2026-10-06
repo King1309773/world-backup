@@ -4,3 +4,7 @@ build/
 run/
 out/
 *.zip
+.classpath
+.project
+.settings/
+mcmodsrepo/

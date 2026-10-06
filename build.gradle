@@ -4,7 +4,7 @@ buildscript {
         maven { url = 'https://maven.minecraftforge.net/' }
     }
     dependencies {
-        classpath 'net.minecraftforge.gradle:ForgeGradle:3.+'
+        classpath 'net.minecraftforge.gradle:ForgeGradle:3.0.197'
     }
 }
 
@@ -37,6 +37,7 @@ sourceCompatibility = targetCompatibility = compileJava.sourceCompatibility = co
 
 minecraft {
     mappings channel: 'stable', version: '39-1.12'
+    accessTransformer = file('src/main/resources/worldbackup_at.cfg')
 
     runs {
         client {
