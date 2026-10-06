@@ -40,7 +40,7 @@ public final class BackupVersion {
         this.originalBytes = originalBytes;
         this.archiveBytes = archiveBytes;
         this.durationMillis = durationMillis;
-        this.manifest = new SnapshotManifest(Objects.requireNonNull(manifest, "manifest").getFiles());
+        this.manifest = new SnapshotManifest(Objects.requireNonNull(manifest, "manifest"));
         this.changedPaths = normalizePaths(changedPaths, "changedPaths");
         this.deletedPaths = normalizePaths(deletedPaths, "deletedPaths");
     }
@@ -115,7 +115,7 @@ public final class BackupVersion {
     }
 
     public SnapshotManifest getManifest() {
-        return manifest;
+        return new SnapshotManifest(manifest);
     }
 
     public List<String> getChangedPaths() {

@@ -8,6 +8,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.rlcmj.worldbackup.core.BackupCatalog;
 import com.rlcmj.worldbackup.core.BackupException;
+import com.rlcmj.worldbackup.core.BackupMode;
+import com.rlcmj.worldbackup.core.BackupTrigger;
 import com.rlcmj.worldbackup.core.BackupVersion;
 import com.rlcmj.worldbackup.core.FileFingerprint;
 import com.rlcmj.worldbackup.core.SnapshotManifest;
@@ -15,6 +17,7 @@ import com.rlcmj.worldbackup.core.SnapshotManifest;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,11 +44,7 @@ public final class CatalogStore {
         Path index = repository.resolve(INDEX_NAME);
         try (Reader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
             JsonElement json = new JsonParser().parse(reader);
-            int formatVersion = readFormatVersion(json);
-            if (formatVersion != BackupCatalog.FORMAT_VERSION) {
-                throw new BackupException("worldbackup.error.catalog_version",
-                    formatVersion);
-            }
+            readFormatVersion(json);
             validateStructure(json.getAsJsonObject());
             BackupCatalog catalog = gson.fromJson(json, BackupCatalog.class);
             validate(catalog);
@@ -57,7 +56,7 @@ public final class CatalogStore {
         }
     }
 
-    private static int readFormatVersion(JsonElement json) throws BackupException {
+    private static void readFormatVersion(JsonElement json) throws BackupException {
         if (json == null || !json.isJsonObject()) {
             throw corrupt();
         }
@@ -65,12 +64,21 @@ public final class CatalogStore {
         if (!version.isJsonPrimitive() || !version.getAsJsonPrimitive().isNumber()) {
             throw corrupt();
         }
-        return version.getAsInt();
+        String encoded = version.getAsString();
+        if (!encoded.matches("-?(0|[1-9][0-9]*)")) {
+            throw corrupt();
+        }
+        BigInteger parsed = new BigInteger(encoded);
+        if (!BigInteger.valueOf(BackupCatalog.FORMAT_VERSION).equals(parsed)) {
+            Object argument = parsed.bitLength() < Integer.SIZE - 1
+                ? parsed.intValue() : encoded;
+            throw new BackupException("worldbackup.error.catalog_version", argument);
+        }
     }
 
     private static void validateStructure(JsonObject catalog) throws BackupException {
-        required(catalog, "worldId");
-        required(catalog, "displayName");
+        requiredString(catalog, "worldId");
+        requiredString(catalog, "displayName");
         JsonArray versions = requiredArray(catalog, "versions");
         for (JsonElement value : versions) {
             if (!value.isJsonObject()) {
@@ -81,14 +89,19 @@ public final class CatalogStore {
     }
 
     private static void validateVersionStructure(JsonObject version) throws BackupException {
-        String[] fields = {"id", "createdAt", "trigger", "mode", "archiveName", "visible",
-            "originalBytes", "archiveBytes", "durationMillis", "manifest", "changedPaths",
-            "deletedPaths"};
-        for (String field : fields) {
-            required(version, field);
-        }
-        requiredArray(version, "changedPaths");
-        requiredArray(version, "deletedPaths");
+        requiredString(version, "id");
+        requiredLong(version, "createdAt");
+        requiredEnum(version, "trigger", BackupTrigger.class);
+        requiredEnum(version, "mode", BackupMode.class);
+        requiredString(version, "archiveName");
+        optionalString(version, "parentId");
+        optionalString(version, "baseId");
+        requiredBoolean(version, "visible");
+        requiredLong(version, "originalBytes");
+        requiredLong(version, "archiveBytes");
+        requiredLong(version, "durationMillis");
+        validateStringArray(requiredArray(version, "changedPaths"));
+        validateStringArray(requiredArray(version, "deletedPaths"));
         JsonElement manifestValue = required(version, "manifest");
         if (!manifestValue.isJsonObject()) {
             throw corrupt();
@@ -99,10 +112,70 @@ public final class CatalogStore {
                 throw corrupt();
             }
             JsonObject fingerprint = entry.getValue().getAsJsonObject();
-            required(fingerprint, "size");
-            required(fingerprint, "modifiedTimeMillis");
-            required(fingerprint, "sha256");
+            requiredLong(fingerprint, "size");
+            requiredLong(fingerprint, "modifiedTimeMillis");
+            requiredString(fingerprint, "sha256");
         }
+    }
+
+    private static void validateStringArray(JsonArray values) throws BackupException {
+        for (JsonElement value : values) {
+            if (!isString(value)) {
+                throw corrupt();
+            }
+        }
+    }
+
+    private static String requiredString(JsonObject object, String name) throws BackupException {
+        JsonElement value = required(object, name);
+        if (!isString(value)) {
+            throw corrupt();
+        }
+        return value.getAsString();
+    }
+
+    private static void optionalString(JsonObject object, String name) throws BackupException {
+        JsonElement value = object.get(name);
+        if (value != null && !value.isJsonNull() && !isString(value)) {
+            throw corrupt();
+        }
+    }
+
+    private static void requiredLong(JsonObject object, String name) throws BackupException {
+        JsonElement value = required(object, name);
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+            throw corrupt();
+        }
+        String encoded = value.getAsString();
+        if (!encoded.matches("-?(0|[1-9][0-9]*)")) {
+            throw corrupt();
+        }
+        try {
+            Long.parseLong(encoded);
+        } catch (NumberFormatException failure) {
+            throw corrupt();
+        }
+    }
+
+    private static void requiredBoolean(JsonObject object, String name) throws BackupException {
+        JsonElement value = required(object, name);
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+            throw corrupt();
+        }
+    }
+
+    private static <T extends Enum<T>> void requiredEnum(JsonObject object, String name,
+                                                          Class<T> type) throws BackupException {
+        String value = requiredString(object, name);
+        try {
+            Enum.valueOf(type, value);
+        } catch (IllegalArgumentException failure) {
+            throw corrupt();
+        }
+    }
+
+    private static boolean isString(JsonElement value) {
+        return value.isJsonPrimitive() && value.getAsJsonPrimitive().isString();
     }
 
     private static JsonArray requiredArray(JsonObject object, String name) throws BackupException {

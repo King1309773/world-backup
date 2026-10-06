@@ -19,6 +19,10 @@ public final class SnapshotManifest {
         Objects.requireNonNull(files, "files").forEach(this::put);
     }
 
+    public SnapshotManifest(SnapshotManifest source) {
+        this(Objects.requireNonNull(source, "source").files);
+    }
+
     public void put(String path, FileFingerprint fingerprint) {
         files.put(normalizePath(path), Objects.requireNonNull(fingerprint, "fingerprint"));
     }
