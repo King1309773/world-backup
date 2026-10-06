@@ -1,0 +1,6 @@
+.gradle/
+.toolchains/
+build/
+run/
+out/
+*.zip

@@ -1,0 +1,9 @@
+[
+  {
+    "modid": "worldbackup",
+    "name": "World Backup",
+    "description": "Configurable full and incremental backups for single-player worlds.",
+    "version": "${version}",
+    "mcversion": "${mcversion}"
+  }
+]

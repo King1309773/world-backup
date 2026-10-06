@@ -1,0 +1,6 @@
+{
+  "pack": {
+    "pack_format": 3,
+    "description": "Configurable full and incremental backups for single-player worlds."
+  }
+}
