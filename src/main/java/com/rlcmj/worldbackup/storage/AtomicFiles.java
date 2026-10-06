@@ -91,10 +91,12 @@ public final class AtomicFiles {
                                                FileOperations operations) throws IOException {
         Path backup = target.resolveSibling(target.getFileName().toString() + ".bak");
         boolean backupCreated = false;
-        operations.deleteIfExists(backup);
+        if (operations.exists(backup)) {
+            throw recoveryArtifactExists(backup);
+        }
         if (operations.exists(target)) {
             try {
-                operations.copy(target, backup, StandardCopyOption.REPLACE_EXISTING);
+                operations.copy(target, backup);
                 backupCreated = true;
             } catch (IOException failure) {
                 cleanup(backup, failure, operations);
@@ -106,17 +108,10 @@ public final class AtomicFiles {
             operations.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException failure) {
             if (backupCreated) {
-                try {
-                    operations.move(backup, target, StandardCopyOption.REPLACE_EXISTING);
-                    backupCreated = false;
-                } catch (IOException rollbackFailure) {
-                    throw recoveryRequired(failure, rollbackFailure, backup);
-                }
+                restoreFromBackup(backup, target, failure, operations);
+                backupCreated = false;
             } else {
                 cleanup(target, failure, operations);
-            }
-            if (backupCreated) {
-                cleanup(backup, failure, operations);
             }
             throw failure;
         }
@@ -125,15 +120,8 @@ public final class AtomicFiles {
             try {
                 operations.deleteIfExists(backup);
             } catch (IOException failure) {
-                try {
-                    operations.move(backup, target, StandardCopyOption.REPLACE_EXISTING);
-                    backupCreated = false;
-                } catch (IOException rollbackFailure) {
-                    throw recoveryRequired(failure, rollbackFailure, backup);
-                }
-                if (backupCreated) {
-                    cleanup(backup, failure, operations);
-                }
+                restoreFromBackup(backup, target, failure, operations);
+                backupCreated = false;
                 throw failure;
             }
         }
@@ -154,5 +142,25 @@ public final class AtomicFiles {
             + "; original target is preserved at " + recoveryPath, failure);
         recovery.addSuppressed(rollbackFailure);
         return recovery;
+    }
+
+    private static IOException recoveryArtifactExists(Path backup) {
+        Path recoveryPath = backup.toAbsolutePath().normalize();
+        return new IOException("Recovery artifact already exists at " + recoveryPath);
+    }
+
+    private static void restoreFromBackup(Path backup, Path target, IOException failure,
+                                          FileOperations operations) throws IOException {
+        try {
+            operations.copy(backup, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException rollbackFailure) {
+            throw recoveryRequired(failure, rollbackFailure, backup);
+        }
+        try {
+            operations.deleteIfExists(backup);
+        } catch (IOException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+            throw failure;
+        }
     }
 }

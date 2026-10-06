@@ -34,6 +34,8 @@ import java.util.Set;
 
 public final class CatalogStore {
     private static final String INDEX_NAME = "index.json";
+    // Bounds recursive parsing so hostile unknown fields cannot exhaust the JVM stack.
+    static final int MAX_JSON_DEPTH = 128;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
     public void save(Path repository, BackupCatalog catalog) throws BackupException {
@@ -63,6 +65,8 @@ public final class CatalogStore {
                 throw failure;
             } catch (RuntimeException failure) {
                 throw new BackupException("worldbackup.error.catalog_corrupt", failure);
+            } catch (StackOverflowError failure) {
+                throw new BackupException("worldbackup.error.catalog_corrupt", failure);
             }
         } catch (BackupException failure) {
             throw failure;
@@ -75,7 +79,7 @@ public final class CatalogStore {
         JsonReader reader = new JsonReader(source);
         reader.setLenient(false);
         try {
-            JsonElement value = readValue(reader);
+            JsonElement value = readValue(reader, 1);
             if (reader.peek() != JsonToken.END_DOCUMENT) {
                 throw new CatalogSyntaxException("Trailing JSON content");
             }
@@ -86,13 +90,16 @@ public final class CatalogStore {
         }
     }
 
-    private static JsonElement readValue(JsonReader reader) throws IOException {
+    private static JsonElement readValue(JsonReader reader, int depth) throws IOException {
+        if (depth > MAX_JSON_DEPTH) {
+            throw new CatalogSyntaxException("JSON nesting exceeds " + MAX_JSON_DEPTH);
+        }
         JsonToken token = reader.peek();
         switch (token) {
             case BEGIN_OBJECT:
-                return readObject(reader);
+                return readObject(reader, depth);
             case BEGIN_ARRAY:
-                return readArray(reader);
+                return readArray(reader, depth);
             case STRING:
                 return new JsonPrimitive(reader.nextString());
             case NUMBER:
@@ -107,7 +114,7 @@ public final class CatalogStore {
         }
     }
 
-    private static JsonObject readObject(JsonReader reader) throws IOException {
+    private static JsonObject readObject(JsonReader reader, int depth) throws IOException {
         JsonObject object = new JsonObject();
         Set<String> names = new HashSet<>();
         reader.beginObject();
@@ -116,17 +123,17 @@ public final class CatalogStore {
             if (!names.add(name)) {
                 throw new CatalogSyntaxException("Duplicate JSON field: " + name);
             }
-            object.add(name, readValue(reader));
+            object.add(name, readValue(reader, depth + 1));
         }
         reader.endObject();
         return object;
     }
 
-    private static JsonArray readArray(JsonReader reader) throws IOException {
+    private static JsonArray readArray(JsonReader reader, int depth) throws IOException {
         JsonArray array = new JsonArray();
         reader.beginArray();
         while (reader.hasNext()) {
-            array.add(readValue(reader));
+            array.add(readValue(reader, depth + 1));
         }
         reader.endArray();
         return array;

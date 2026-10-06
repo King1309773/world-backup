@@ -13,23 +13,37 @@ public final class BackupResult {
     private BackupResult(boolean success, String versionId, long elapsedMillis,
                          long originalBytes, long archiveBytes, String errorKey) {
         this.success = success;
-        this.versionId = versionId;
-        this.elapsedMillis = elapsedMillis;
-        this.originalBytes = originalBytes;
-        this.archiveBytes = archiveBytes;
-        this.errorKey = errorKey;
+        this.versionId = success ? requireText(versionId, "versionId") : versionId;
+        this.elapsedMillis = requireNonNegative(elapsedMillis, "elapsedMillis");
+        this.originalBytes = requireNonNegative(originalBytes, "originalBytes");
+        this.archiveBytes = requireNonNegative(archiveBytes, "archiveBytes");
+        this.errorKey = success ? errorKey : requireText(errorKey, "errorKey");
     }
 
     public static BackupResult success(String versionId, long elapsedMillis,
                                        long originalBytes, long archiveBytes) {
-        return new BackupResult(true, Objects.requireNonNull(versionId, "versionId"),
-            elapsedMillis, originalBytes, archiveBytes, null);
+        return new BackupResult(true, versionId, elapsedMillis, originalBytes, archiveBytes, null);
     }
 
     public static BackupResult failure(String errorKey, long elapsedMillis,
                                        long originalBytes, long archiveBytes) {
         return new BackupResult(false, null, elapsedMillis, originalBytes, archiveBytes,
-            Objects.requireNonNull(errorKey, "errorKey"));
+            errorKey);
+    }
+
+    private static String requireText(String value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.trim().isEmpty()) {
+            throw new IllegalArgumentException(name + " must not be blank");
+        }
+        return value;
+    }
+
+    private static long requireNonNegative(long value, String name) {
+        if (value < 0L) {
+            throw new IllegalArgumentException(name + " must not be negative");
+        }
+        return value;
     }
 
     public boolean isSuccess() {

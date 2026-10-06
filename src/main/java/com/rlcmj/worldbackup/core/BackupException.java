@@ -11,9 +11,17 @@ public class BackupException extends Exception {
     }
 
     public BackupException(String translationKey, Throwable cause, Object... arguments) {
-        super(Objects.requireNonNull(translationKey, "translationKey"), cause);
+        super(requireTranslationKey(translationKey), cause);
         this.translationKey = translationKey;
         this.arguments = arguments == null ? new Object[0] : arguments.clone();
+    }
+
+    private static String requireTranslationKey(String value) {
+        Objects.requireNonNull(value, "translationKey");
+        if (value.trim().isEmpty()) {
+            throw new IllegalArgumentException("translationKey must not be blank");
+        }
+        return value;
     }
 
     public String getTranslationKey() {

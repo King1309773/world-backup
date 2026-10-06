@@ -105,6 +105,33 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void rejectsExcessivelyDeepUnknownJsonWithoutStackOverflow() throws Exception {
+        Path repo = temp.newFolder("deep-json-rejected").toPath();
+        Files.write(repo.resolve("index.json"),
+            catalogWithDeepUnknownValue(CatalogStore.MAX_JSON_DEPTH)
+            .getBytes(StandardCharsets.UTF_8));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new CatalogStore().load(repo));
+
+        assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        assertFalse(error.getCause() instanceof StackOverflowError);
+    }
+
+    @Test
+    public void acceptsUnknownJsonWithinDepthLimit() throws Exception {
+        Path repo = temp.newFolder("deep-json-valid").toPath();
+        Files.write(repo.resolve("index.json"),
+            catalogWithDeepUnknownValue(CatalogStore.MAX_JSON_DEPTH - 2)
+            .getBytes(StandardCharsets.UTF_8));
+
+        BackupCatalog loaded = new CatalogStore().load(repo);
+
+        assertEquals("World1", loaded.getWorldId());
+        assertTrue(loaded.getVersions().isEmpty());
+    }
+
+    @Test
     public void missingCatalogIsReportedAsReadFailure() throws Exception {
         Path repo = temp.newFolder("missing-catalog").toPath();
 
@@ -264,7 +291,6 @@ public class CatalogStoreTest {
         Path target = directory.resolve("index.json");
         Path temporary = directory.resolve("index.json.tmp");
         Path backup = directory.resolve("index.json.bak");
-        Files.write(backup, "stale".getBytes(StandardCharsets.UTF_8));
 
         AtomicFiles.FileOperations destructiveFallback = destructiveFallback(temporary, target);
         assertThrows(IOException.class, () -> AtomicFiles.write(target,
@@ -308,7 +334,7 @@ public class CatalogStoreTest {
 
             @Override
             public boolean deleteIfExists(Path path) throws IOException {
-                if (path.equals(backup) && ++backupDeletes[0] == 2) {
+                if (path.equals(backup) && ++backupDeletes[0] == 1) {
                     throw new IOException("simulated backup cleanup failure");
                 }
                 return Files.deleteIfExists(path);
@@ -332,6 +358,34 @@ public class CatalogStoreTest {
     @Test
     public void cleanupAndRollbackFailurePreserveRecoveryBackup() throws Exception {
         assertRollbackFailurePreservesBackup("cleanup-rollback-failure", false);
+    }
+
+    @Test
+    public void existingRecoveryBackupBlocksSubsequentFallbackAttempt() throws Exception {
+        Path directory = temp.newFolder("existing-recovery-backup").toPath();
+        Path target = directory.resolve("index.json");
+        Path temporary = directory.resolve("index.json.tmp");
+        Path backup = directory.resolve("index.json.bak");
+        Files.write(target, "old".getBytes(StandardCharsets.UTF_8));
+        IOException replacementFailure = new IOException("replacement failed after move");
+        IOException rollbackFailure = new IOException("rollback copy failed after mutation");
+
+        assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)),
+            rollbackCopyFailureOperations(temporary, target, backup, true,
+                replacementFailure, rollbackFailure)));
+        byte[] targetBeforeRetry = Files.readAllBytes(target);
+        byte[] backupBeforeRetry = Files.readAllBytes(backup);
+
+        IOException retryFailure = assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("retry".getBytes(StandardCharsets.UTF_8)),
+            atomicMoveUnsupported()));
+
+        assertTrue(retryFailure.getMessage().contains(
+            backup.toAbsolutePath().normalize().toString()));
+        assertTrue(Arrays.equals(targetBeforeRetry, Files.readAllBytes(target)));
+        assertTrue(Arrays.equals(backupBeforeRetry, Files.readAllBytes(backup)));
+        assertFalse(Files.exists(temporary));
     }
 
     @Test
@@ -572,6 +626,26 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void backupResultsRejectBlankKeysAndNegativeMeasurements() {
+        assertThrows(IllegalArgumentException.class,
+            () -> BackupResult.success(" ", 0L, 0L, 0L));
+        assertThrows(IllegalArgumentException.class,
+            () -> BackupResult.failure("\t", 0L, 0L, 0L));
+
+        for (long[] values : Arrays.asList(
+            new long[] {-1L, 0L, 0L},
+            new long[] {0L, -1L, 0L},
+            new long[] {0L, 0L, -1L}
+        )) {
+            assertThrows(IllegalArgumentException.class,
+                () -> BackupResult.success("v1", values[0], values[1], values[2]));
+            assertThrows(IllegalArgumentException.class,
+                () -> BackupResult.failure("worldbackup.error.failed",
+                    values[0], values[1], values[2]));
+        }
+    }
+
+    @Test
     public void backupExceptionPreservesCauseAndArguments() {
         IOException cause = new IOException("disk failure");
         BackupException error = new BackupException("worldbackup.error.failed", cause,
@@ -580,6 +654,13 @@ public class CatalogStoreTest {
         assertEquals("worldbackup.error.failed", error.getTranslationKey());
         assertEquals(Arrays.asList("World1", 3), Arrays.asList(error.getArguments()));
         assertSame(cause, error.getCause());
+    }
+
+    @Test
+    public void backupExceptionRejectsBlankTranslationKey() {
+        assertThrows(IllegalArgumentException.class, () -> new BackupException(" "));
+        assertThrows(IllegalArgumentException.class,
+            () -> new BackupException("\t", new IOException("cause")));
     }
 
     private static AtomicFiles.FileOperations destructiveFallback(Path temporary, Path target) {
@@ -655,18 +736,33 @@ public class CatalogStoreTest {
         IOException primaryFailure = new IOException(failReplacement
             ? "replacement failed after move" : "backup cleanup failed");
         IOException rollbackFailure = new IOException("rollback failed");
-        int[] backupDeletes = {0};
+        AtomicFiles.FileOperations failures = rollbackCopyFailureOperations(temporary, target,
+            backup, failReplacement, primaryFailure, rollbackFailure);
 
-        AtomicFiles.FileOperations failures = new AtomicFiles.FileOperations() {
+        IOException failure = assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)), failures));
+
+        assertTrue(failure.getMessage().contains(primaryFailure.getMessage()));
+        assertTrue(failure.getMessage().contains(backup.toAbsolutePath().normalize().toString()));
+        assertSame(primaryFailure, failure.getCause());
+        assertEquals(1, failure.getSuppressed().length);
+        assertSame(rollbackFailure, failure.getSuppressed()[0]);
+        assertEquals("old", new String(Files.readAllBytes(backup), StandardCharsets.UTF_8));
+        assertEquals("old", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(temporary));
+    }
+
+    private static AtomicFiles.FileOperations rollbackCopyFailureOperations(Path temporary,
+            Path target, Path backup, boolean failReplacement, IOException primaryFailure,
+            IOException rollbackFailure) {
+        int[] backupDeletes = {0};
+        return new AtomicFiles.FileOperations() {
             @Override
             public void move(Path source, Path destination, CopyOption... options)
                     throws IOException {
                 if (Arrays.asList(options).contains(java.nio.file.StandardCopyOption.ATOMIC_MOVE)) {
                     throw new AtomicMoveNotSupportedException(source.toString(),
                         destination.toString(), "simulated");
-                }
-                if (source.equals(backup) && destination.equals(target)) {
-                    throw rollbackFailure;
                 }
                 Files.move(source, destination, options);
                 if (failReplacement && source.equals(temporary) && destination.equals(target)) {
@@ -678,6 +774,9 @@ public class CatalogStoreTest {
             public void copy(Path source, Path destination, CopyOption... options)
                     throws IOException {
                 Files.copy(source, destination, options);
+                if (source.equals(backup) && destination.equals(target)) {
+                    throw rollbackFailure;
+                }
             }
 
             @Override
@@ -687,24 +786,12 @@ public class CatalogStoreTest {
 
             @Override
             public boolean deleteIfExists(Path path) throws IOException {
-                if (!failReplacement && path.equals(backup) && ++backupDeletes[0] == 2) {
+                if (!failReplacement && path.equals(backup) && ++backupDeletes[0] == 1) {
                     throw primaryFailure;
                 }
                 return Files.deleteIfExists(path);
             }
         };
-
-        IOException failure = assertThrows(IOException.class, () -> AtomicFiles.write(target,
-            output -> output.write("new".getBytes(StandardCharsets.UTF_8)), failures));
-
-        assertTrue(failure.getMessage().contains(primaryFailure.getMessage()));
-        assertTrue(failure.getMessage().contains(backup.toAbsolutePath().normalize().toString()));
-        assertSame(primaryFailure, failure.getCause());
-        assertEquals(1, failure.getSuppressed().length);
-        assertSame(rollbackFailure, failure.getSuppressed()[0]);
-        assertEquals("old", new String(Files.readAllBytes(backup), StandardCharsets.UTF_8));
-        assertEquals("new", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
-        assertFalse(Files.exists(temporary));
     }
 
     private static String fullyPopulatedCatalogJson() {
@@ -715,5 +802,14 @@ public class CatalogStoreTest {
             + "\"durationMillis\":4,\"manifest\":{\"files\":{\"level.dat\":{"
             + "\"size\":12,\"modifiedTimeMillis\":34,\"sha256\":\"abc\"}}},"
             + "\"changedPaths\":[\"level.dat\"],\"deletedPaths\":[\"old.dat\"]}]}";
+    }
+
+    private static String catalogWithDeepUnknownValue(int depth) {
+        String value = "0";
+        for (int index = 0; index < depth; index++) {
+            value = "{\"nested\":" + value + "}";
+        }
+        return "{\"formatVersion\":1,\"worldId\":\"World1\","
+            + "\"displayName\":\"World\",\"versions\":[],\"unknown\":" + value + "}";
     }
 }
