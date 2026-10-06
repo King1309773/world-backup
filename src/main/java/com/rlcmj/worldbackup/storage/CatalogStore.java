@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonIOException;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
@@ -21,8 +22,9 @@ import com.rlcmj.worldbackup.core.SnapshotManifest;
 
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.OutputStreamWriter;
+import java.io.OutputStream;
 import java.io.Reader;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -30,6 +32,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 public final class CatalogStore {
@@ -37,15 +40,30 @@ public final class CatalogStore {
     // Bounds recursive parsing so hostile unknown fields cannot exhaust the JVM stack.
     static final int MAX_JSON_DEPTH = 128;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    private final AtomicWriter atomicWriter;
+
+    public CatalogStore() {
+        this(AtomicFiles::write);
+    }
+
+    CatalogStore(AtomicWriter atomicWriter) {
+        this.atomicWriter = Objects.requireNonNull(atomicWriter, "atomicWriter");
+    }
+
+    interface AtomicWriter {
+        void write(Path target, AtomicFiles.IOConsumer<OutputStream> writer) throws IOException;
+    }
 
     public void save(Path repository, BackupCatalog catalog) throws BackupException {
         validate(catalog);
+        final byte[] encoded;
         try {
-            AtomicFiles.write(repository.resolve(INDEX_NAME), output -> {
-                OutputStreamWriter text = new OutputStreamWriter(output, StandardCharsets.UTF_8);
-                gson.toJson(catalog, text);
-                text.flush();
-            });
+            encoded = gson.toJson(catalog).getBytes(StandardCharsets.UTF_8);
+        } catch (JsonIOException failure) {
+            throw new BackupException("worldbackup.error.catalog_write", failure);
+        }
+        try {
+            atomicWriter.write(repository.resolve(INDEX_NAME), output -> output.write(encoded));
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.catalog_write", failure);
         }
@@ -76,7 +94,9 @@ public final class CatalogStore {
     }
 
     private static JsonElement readDocument(Reader source) throws IOException {
-        JsonReader reader = new JsonReader(source);
+        String rawJson = readAll(source);
+        validateRawJsonStrings(rawJson);
+        JsonReader reader = new JsonReader(new StringReader(rawJson));
         reader.setLenient(false);
         try {
             JsonElement value = readValue(reader, 1);
@@ -88,6 +108,77 @@ public final class CatalogStore {
                  | IllegalStateException failure) {
             throw new CatalogSyntaxException("Invalid JSON", failure);
         }
+    }
+
+    private static String readAll(Reader source) throws IOException {
+        StringBuilder text = new StringBuilder();
+        char[] buffer = new char[4096];
+        int count;
+        while ((count = source.read(buffer)) != -1) {
+            text.append(buffer, 0, count);
+        }
+        return text.toString();
+    }
+
+    private static void validateRawJsonStrings(String source) {
+        boolean inString = false;
+        boolean escaped = false;
+        int unicodeDigits = 0;
+        for (int index = 0; index < source.length(); index++) {
+            char value = source.charAt(index);
+            if (!inString) {
+                if (value == '"') {
+                    inString = true;
+                } else if (value <= 0x1f && value != '\t' && value != '\n' && value != '\r') {
+                    throw new CatalogSyntaxException("Invalid control character outside JSON string");
+                }
+                continue;
+            }
+            if (unicodeDigits > 0) {
+                if (!isHexDigit(value)) {
+                    throw new CatalogSyntaxException("Invalid JSON unicode escape");
+                }
+                unicodeDigits--;
+                continue;
+            }
+            if (escaped) {
+                escaped = false;
+                switch (value) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                    case 'b':
+                    case 'f':
+                    case 'n':
+                    case 'r':
+                    case 't':
+                        break;
+                    case 'u':
+                        unicodeDigits = 4;
+                        break;
+                    default:
+                        throw new CatalogSyntaxException("Invalid JSON string escape");
+                }
+                continue;
+            }
+            if (value <= 0x1f) {
+                throw new CatalogSyntaxException("Unescaped control character in JSON string");
+            }
+            if (value == '\\') {
+                escaped = true;
+            } else if (value == '"') {
+                inString = false;
+            }
+        }
+        if (escaped || unicodeDigits > 0) {
+            throw new CatalogSyntaxException("Incomplete JSON string escape");
+        }
+    }
+
+    private static boolean isHexDigit(char value) {
+        return value >= '0' && value <= '9'
+            || value >= 'a' && value <= 'f'
+            || value >= 'A' && value <= 'F';
     }
 
     private static JsonElement readValue(JsonReader reader, int depth) throws IOException {

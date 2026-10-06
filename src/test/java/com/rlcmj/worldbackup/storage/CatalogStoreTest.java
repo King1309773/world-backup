@@ -14,6 +14,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
@@ -47,6 +48,28 @@ public class CatalogStoreTest {
 
         assertEquals(catalog, loaded);
         assertFalse(Files.exists(repo.resolve("index.json.tmp")));
+    }
+
+    @Test
+    public void catalogWriteFailureIsCheckedAndPreservesExistingIndex() throws Exception {
+        Path repo = temp.newFolder("catalog-write-failure").toPath();
+        Path index = repo.resolve("index.json");
+        Path temporary = repo.resolve("index.json.tmp");
+        Files.write(index, "old index".getBytes(StandardCharsets.UTF_8));
+        IOException diskFailure = new IOException("simulated mid-write failure");
+        CatalogStore store = new CatalogStore((target, writer) -> AtomicFiles.write(target,
+            output -> writer.accept(failingAfterFourBytes(output, diskFailure))));
+        char[] displayName = new char[20000];
+        Arrays.fill(displayName, 'W');
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.save(repo, BackupCatalog.empty("World1", new String(displayName))));
+
+        assertEquals("worldbackup.error.catalog_write", error.getTranslationKey());
+        assertTrue(containsCause(error, diskFailure));
+        assertEquals("old index",
+            new String(Files.readAllBytes(index), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(temporary));
     }
 
     @Test
@@ -86,6 +109,41 @@ public class CatalogStoreTest {
                 BackupException.class, () -> new CatalogStore().load(repo));
 
             assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void rejectsRawControlCharactersAndInvalidStringEscapes() throws Exception {
+        Path repo = temp.newFolder("strict-json-strings").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String json : Arrays.asList(
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\"Wo\nrld\""),
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\"Wo\trld\""),
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\"Wo\u0000rld\""),
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\"Wo\\\nrld\""),
+            valid.replace("\"displayName\":\"World\"", "\"displayName\":\"Wo\\xrld\"")
+        )) {
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupException error = assertThrows("Expected strict string rejection",
+                BackupException.class, () -> new CatalogStore().load(repo));
+
+            assertEquals("worldbackup.error.catalog_corrupt", error.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void acceptsValidEscapedControlCharactersInStrings() throws Exception {
+        Path repo = temp.newFolder("escaped-json-strings").toPath();
+        String valid = fullyPopulatedCatalogJson();
+        for (String escaped : Arrays.asList("World\\nName", "World\\u000AName")) {
+            String json = valid.replace("\"displayName\":\"World\"",
+                "\"displayName\":\"" + escaped + "\"");
+            Files.write(repo.resolve("index.json"), json.getBytes(StandardCharsets.UTF_8));
+
+            BackupCatalog loaded = new CatalogStore().load(repo);
+
+            assertEquals("World\nName", loaded.getDisplayName());
         }
     }
 
@@ -802,6 +860,29 @@ public class CatalogStoreTest {
             + "\"durationMillis\":4,\"manifest\":{\"files\":{\"level.dat\":{"
             + "\"size\":12,\"modifiedTimeMillis\":34,\"sha256\":\"abc\"}}},"
             + "\"changedPaths\":[\"level.dat\"],\"deletedPaths\":[\"old.dat\"]}]}";
+    }
+
+    private static OutputStream failingAfterFourBytes(OutputStream output, IOException failure) {
+        return new OutputStream() {
+            private int count;
+
+            @Override
+            public void write(int value) throws IOException {
+                if (count++ >= 4) {
+                    throw failure;
+                }
+                output.write(value);
+            }
+        };
+    }
+
+    private static boolean containsCause(Throwable failure, Throwable expected) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current == expected) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String catalogWithDeepUnknownValue(int depth) {
