@@ -141,9 +141,34 @@ public class SnapshotScannerTest {
         }, new BackupCancellation());
 
         Collections.sort(pathsSeen);
-        assertEquals(Arrays.asList("kept.dat", "sub/excluded.dat"), pathsSeen);
+        assertEquals(Arrays.asList("kept.dat", "sub", "sub/excluded.dat"), pathsSeen);
         assertEquals(Collections.singletonList("kept.dat"),
             new ArrayList<>(manifest.getFiles().keySet()));
+    }
+
+    @Test
+    public void excludedDirectorySkipsItsEntireSubtree() throws Exception {
+        Path world = temp.newFolder("excluded-directory-world").toPath();
+        write(world.resolve("excluded/nested/hidden.dat"), "hidden");
+        write(world.resolve("kept.dat"), "kept");
+        List<String> pathsSeen = new ArrayList<>();
+        AtomicInteger hashes = new AtomicInteger();
+        SnapshotScanner scanner = new SnapshotScanner((path, cancellation) -> {
+            hashes.incrementAndGet();
+            return HASH_B;
+        });
+
+        SnapshotManifest manifest = scanner.scan(world, null, path -> {
+            pathsSeen.add(path);
+            return "excluded".equals(path);
+        }, new BackupCancellation());
+
+        assertEquals(Collections.singletonList("kept.dat"),
+            new ArrayList<>(manifest.getFiles().keySet()));
+        assertTrue(pathsSeen.contains("excluded"));
+        assertFalse(pathsSeen.contains("excluded/nested"));
+        assertFalse(pathsSeen.contains("excluded/nested/hidden.dat"));
+        assertEquals(1, hashes.get());
     }
 
     @Test
@@ -221,18 +246,33 @@ public class SnapshotScannerTest {
     }
 
     @Test
-    public void rejectsSymbolicLinkToDirectoryWithoutRecursing() throws Exception {
+    public void skipsInRootSymbolicLinkToDirectoryWithoutRecursing() throws Exception {
         Path world = temp.newFolder("directory-link-world").toPath();
         Path targetDirectory = Files.createDirectories(world.resolve("target"));
         write(targetDirectory.resolve("inside.dat"), "inside");
         Path link = world.resolve("linked-directory");
         createSymbolicLinkOrSkip(link, targetDirectory.getFileName());
 
+        SnapshotManifest manifest = scan(world);
+
+        assertTrue(manifest.getFiles().containsKey("target/inside.dat"));
+        assertFalse(manifest.getFiles().containsKey("linked-directory/inside.dat"));
+        assertFalse(manifest.getFiles().containsKey("linked-directory"));
+    }
+
+    @Test
+    public void rejectsEscapingSymbolicLinkToDirectory() throws Exception {
+        Path world = temp.newFolder("escaping-directory-link-world").toPath();
+        Path outside = temp.newFolder("outside-directory-target").toPath();
+        write(outside.resolve("secret.dat"), "outside");
+        Path link = world.resolve("escape-directory");
+        createSymbolicLinkOrSkip(link, outside);
+
         BackupException error = assertThrows(BackupException.class,
             () -> scan(world));
 
-        assertEquals("worldbackup.error.scan", error.getTranslationKey());
-        assertTrue(error.getCause() instanceof IOException);
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
+        assertEquals("escape-directory", error.getArguments()[0]);
     }
 
     @Test
@@ -252,7 +292,7 @@ public class SnapshotScannerTest {
     }
 
     @Test
-    public void rejectsInRootWindowsDirectoryJunctionWithoutRecursing() throws Exception {
+    public void skipsInRootWindowsDirectoryJunctionWithoutRecursing() throws Exception {
         Assume.assumeTrue("Windows junctions only", File.separatorChar == '\\');
         Path world = temp.newFolder("inside-junction-world").toPath();
         Path target = Files.createDirectories(world.resolve("target"));
@@ -260,11 +300,11 @@ public class SnapshotScannerTest {
         Path junction = world.resolve("junction");
         createJunctionOrSkip(junction, target);
 
-        BackupException error = assertThrows(BackupException.class,
-            () -> scan(world));
+        SnapshotManifest manifest = scan(world);
 
-        assertEquals("worldbackup.error.scan", error.getTranslationKey());
-        assertTrue(error.getCause() instanceof IOException);
+        assertTrue(manifest.getFiles().containsKey("target/inside.dat"));
+        assertFalse(manifest.getFiles().containsKey("junction/inside.dat"));
+        assertFalse(manifest.getFiles().containsKey("junction"));
     }
 
     @Test

@@ -76,10 +76,12 @@ public final class SnapshotScanner {
                     } catch (BackupException escape) {
                         throw new PathEscapeIOException(escape);
                     }
+                    if (exclusion != null && exclusion.test(relativePath)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
                     if (attributes.isOther() || Files.isSymbolicLink(directory)
                             || !directory.toAbsolutePath().normalize().equals(realDirectory)) {
-                        throw new IOException(
-                            "Linked directories are not supported: " + relativePath);
+                        return FileVisitResult.SKIP_SUBTREE;
                     }
                 }
                 return FileVisitResult.CONTINUE;
@@ -90,8 +92,7 @@ public final class SnapshotScanner {
                     throws IOException {
                 cancellation.check();
                 String relativePath = portableRelativePath(resolvedRoot, file);
-                if ("session.lock".equals(relativePath)
-                        || exclusion != null && exclusion.test(relativePath)) {
+                if ("session.lock".equals(relativePath)) {
                     return FileVisitResult.CONTINUE;
                 }
 
@@ -106,6 +107,14 @@ public final class SnapshotScanner {
                     }
                     contentAttributes = Files.readAttributes(contentPath,
                         BasicFileAttributes.class);
+                }
+                if (exclusion != null && exclusion.test(relativePath)) {
+                    return FileVisitResult.CONTINUE;
+                }
+                if (attributes.isSymbolicLink()) {
+                    if (contentAttributes.isDirectory()) {
+                        return FileVisitResult.CONTINUE;
+                    }
                     if (!contentAttributes.isRegularFile()) {
                         throw new IOException("Symbolic link does not resolve to a regular file: "
                             + relativePath);
