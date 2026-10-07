@@ -130,7 +130,8 @@ public final class SnapshotScanner {
                     return FileVisitResult.CONTINUE;
                 }
 
-                FileState contentState = FileState.capture(contentPath);
+                FileState contentState = FileState.capture(contentPath, resolvedRoot,
+                    relativePath);
                 long size = contentState.size;
                 long modifiedTimeMillis = contentState.modifiedTime.toMillis();
                 FileFingerprint oldFingerprint = previous == null
@@ -229,7 +230,13 @@ public final class SnapshotScanner {
 
             byte[] buffer = new byte[HASH_BUFFER_SIZE];
             expectedState.verify(path);
-            try (InputStream input = streams.open(path)) {
+            InputStream opened;
+            try {
+                opened = streams.open(path);
+            } catch (IOException failure) {
+                throw expectedState.classifyOpenFailure(path, failure);
+            }
+            try (InputStream input = opened) {
                 expectedState.verify(path);
                 while (true) {
                     cancellation.check();
@@ -277,37 +284,100 @@ public final class SnapshotScanner {
         private final long size;
         private final FileTime modifiedTime;
         private final Object fileKey;
+        private final Path resolvedRoot;
+        private final String relativePath;
 
-        private FileState(Path realPath, BasicFileAttributes attributes) {
+        private FileState(Path realPath, BasicFileAttributes attributes,
+                          Path resolvedRoot, String relativePath) {
             this.realPath = realPath;
             this.size = attributes.size();
             this.modifiedTime = attributes.lastModifiedTime();
             this.fileKey = attributes.fileKey();
+            this.resolvedRoot = resolvedRoot;
+            this.relativePath = relativePath;
         }
 
-        private static FileState capture(Path path) throws IOException {
+        private static FileState capture(Path path, Path resolvedRoot,
+                                         String relativePath) throws IOException {
+            Path beforeRealPath = resolveInsideWorld(path, resolvedRoot, relativePath);
             BasicFileAttributes before = Files.readAttributes(path,
                 BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            requireLinkTargetInsideWorld(path, before, resolvedRoot, relativePath);
             if (!before.isRegularFile()) {
                 throw new IOException("Hash target is not a regular file: " + path);
             }
-            Path realPath = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            Path afterRealPath = resolveInsideWorld(path, resolvedRoot, relativePath);
             BasicFileAttributes after = Files.readAttributes(path,
                 BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            if (!sameObservedFile(before, after)) {
+            requireLinkTargetInsideWorld(path, after, resolvedRoot, relativePath);
+            if (!beforeRealPath.equals(afterRealPath) || !sameObservedFile(before, after)) {
                 throw new IOException("File changed while inspecting: " + path);
             }
-            return new FileState(realPath, after);
+            return new FileState(afterRealPath, after, resolvedRoot, relativePath);
         }
 
         private void verify(Path path) throws IOException {
-            FileState current = capture(path);
+            FileState current = capture(path, resolvedRoot, relativePath);
             if (!realPath.equals(current.realPath)
                     || size != current.size
                     || !modifiedTime.equals(current.modifiedTime)
                     || fileKey != null && current.fileKey != null
                         && !fileKey.equals(current.fileKey)) {
                 throw new IOException("File changed while hashing: " + path);
+            }
+        }
+
+        private IOException classifyOpenFailure(Path path, IOException failure)
+                throws PathEscapeIOException {
+            try {
+                validateContainment(path, resolvedRoot, relativePath);
+            } catch (PathEscapeIOException escape) {
+                throw escape;
+            } catch (IOException inspectionFailure) {
+                failure.addSuppressed(inspectionFailure);
+            }
+            return failure;
+        }
+
+        private static void validateContainment(Path path, Path resolvedRoot,
+                                                String relativePath)
+                throws IOException {
+            resolveInsideWorld(path, resolvedRoot, relativePath);
+            BasicFileAttributes attributes = Files.readAttributes(path,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            requireLinkTargetInsideWorld(path, attributes, resolvedRoot, relativePath);
+        }
+
+        private static Path resolveInsideWorld(Path path, Path resolvedRoot,
+                                               String relativePath)
+                throws IOException {
+            Path realPath = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            requireInsideWorldForRead(resolvedRoot, realPath, relativePath);
+            Path parent = path.getParent();
+            if (parent != null) {
+                requireInsideWorldForRead(resolvedRoot, parent.toRealPath(), relativePath);
+            }
+            return realPath;
+        }
+
+        private static void requireLinkTargetInsideWorld(Path path,
+                                                         BasicFileAttributes attributes,
+                                                         Path resolvedRoot,
+                                                         String relativePath)
+                throws IOException {
+            if (attributes.isSymbolicLink()) {
+                requireInsideWorldForRead(resolvedRoot, path.toRealPath(), relativePath);
+            }
+        }
+
+        private static void requireInsideWorldForRead(Path resolvedRoot,
+                                                      Path resolvedTarget,
+                                                      String relativePath)
+                throws PathEscapeIOException {
+            try {
+                requireInsideWorld(resolvedRoot, resolvedTarget, relativePath);
+            } catch (BackupException escape) {
+                throw new PathEscapeIOException(escape);
             }
         }
     }

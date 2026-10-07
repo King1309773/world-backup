@@ -236,7 +236,7 @@ public class SnapshotScannerTest {
     }
 
     @Test
-    public void replacementWithEscapingSymlinkBeforeOpenDoesNotReadTarget() throws Exception {
+    public void replacementWithEscapingSymlinkBeforeOpenReportsPathEscape() throws Exception {
         Path world = temp.newFolder("open-race-world").toPath();
         Path file = write(world.resolve("level.dat"), "inside");
         Path outside = write(temp.newFile("open-race-secret.dat").toPath(), "secret");
@@ -267,13 +267,58 @@ public class SnapshotScannerTest {
             () -> new SnapshotScanner(hasher).scan(world, null, null,
                 new BackupCancellation()));
 
-        assertEquals("worldbackup.error.scan", error.getTranslationKey());
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
         assertTrue(swapped.get());
         assertFalse(opened.get());
         assertEquals(0, reads.get());
         assertEquals("secret", new String(Files.readAllBytes(outside),
             StandardCharsets.UTF_8));
         assertTrue(Files.isSymbolicLink(file));
+    }
+
+    @Test
+    public void replacementOfParentWithEscapingSymlinkDoesNotReadTarget() throws Exception {
+        Path world = temp.newFolder("parent-race-world").toPath();
+        Path parent = Files.createDirectories(world.resolve("region"));
+        write(parent.resolve("r.0.0.mca"), "inside");
+        Path movedParent = world.resolve("original-region");
+        Path outside = temp.newFolder("parent-race-outside").toPath();
+        write(outside.resolve("r.0.0.mca"), "secret");
+        Path probe = world.resolve("directory-symlink-probe");
+        createSymbolicLinkOrSkip(probe, outside);
+        Files.delete(probe);
+        AtomicBoolean swapped = new AtomicBoolean();
+        AtomicInteger reads = new AtomicInteger();
+        SnapshotScanner.InputStreamFactory noFollow =
+            SnapshotScanner.noFollowInputStreamFactory();
+        SnapshotScanner.FileHasher hasher = SnapshotScanner.streamingHasher(path ->
+            new FilterInputStream(noFollow.open(path)) {
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    reads.incrementAndGet();
+                    return super.read(bytes, offset, length);
+                }
+            });
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new SnapshotScanner(hasher).scan(world, null, relativePath -> {
+                if ("region/r.0.0.mca".equals(relativePath)
+                        && swapped.compareAndSet(false, true)) {
+                    try {
+                        Files.move(parent, movedParent);
+                        Files.createSymbolicLink(parent, outside);
+                    } catch (IOException failure) {
+                        throw new IllegalStateException(failure);
+                    }
+                }
+                return false;
+            }, new BackupCancellation()));
+
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
+        assertTrue(swapped.get());
+        assertEquals(0, reads.get());
+        assertEquals("secret", new String(Files.readAllBytes(
+            outside.resolve("r.0.0.mca")), StandardCharsets.UTF_8));
     }
 
     @Test
