@@ -11,17 +11,20 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -109,7 +112,7 @@ public class SnapshotScannerTest {
         long modified = Files.getLastModifiedTime(file).toMillis();
         SnapshotManifest previous = manifest("level.dat", size, modified, HASH_A);
         AtomicInteger hashes = new AtomicInteger();
-        SnapshotScanner scanner = new SnapshotScanner((path, cancellation) -> {
+        SnapshotScanner scanner = new SnapshotScanner((path, state, cancellation) -> {
             hashes.incrementAndGet();
             return HASH_B;
         });
@@ -180,7 +183,7 @@ public class SnapshotScannerTest {
         write(world.resolve("kept.dat"), "kept");
         List<String> pathsSeen = new ArrayList<>();
         AtomicInteger hashes = new AtomicInteger();
-        SnapshotScanner scanner = new SnapshotScanner((path, cancellation) -> {
+        SnapshotScanner scanner = new SnapshotScanner((path, state, cancellation) -> {
             hashes.incrementAndGet();
             return HASH_B;
         });
@@ -230,6 +233,76 @@ public class SnapshotScannerTest {
         assertThrows(InterruptedIOException.class,
             () -> new SnapshotScanner(hasher).scan(world, null, null, cancellation));
         assertEquals(1, reads.get());
+    }
+
+    @Test
+    public void replacementWithEscapingSymlinkBeforeOpenDoesNotReadTarget() throws Exception {
+        Path world = temp.newFolder("open-race-world").toPath();
+        Path file = write(world.resolve("level.dat"), "inside");
+        Path outside = write(temp.newFile("open-race-secret.dat").toPath(), "secret");
+        Path probe = world.resolve("symlink-probe");
+        createSymbolicLinkOrSkip(probe, outside);
+        Files.delete(probe);
+        AtomicBoolean swapped = new AtomicBoolean();
+        AtomicBoolean opened = new AtomicBoolean();
+        AtomicInteger reads = new AtomicInteger();
+        SnapshotScanner.InputStreamFactory noFollow =
+            SnapshotScanner.noFollowInputStreamFactory();
+        SnapshotScanner.FileHasher hasher = SnapshotScanner.streamingHasher(path -> {
+            Files.delete(path);
+            Files.createSymbolicLink(path, outside);
+            swapped.set(true);
+            InputStream input = noFollow.open(path);
+            opened.set(true);
+            return new FilterInputStream(input) {
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    reads.incrementAndGet();
+                    return super.read(bytes, offset, length);
+                }
+            };
+        });
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new SnapshotScanner(hasher).scan(world, null, null,
+                new BackupCancellation()));
+
+        assertEquals("worldbackup.error.scan", error.getTranslationKey());
+        assertTrue(swapped.get());
+        assertFalse(opened.get());
+        assertEquals(0, reads.get());
+        assertEquals("secret", new String(Files.readAllBytes(outside),
+            StandardCharsets.UTF_8));
+        assertTrue(Files.isSymbolicLink(file));
+    }
+
+    @Test
+    public void contentChangeDuringHashingFailsScan() throws Exception {
+        Path world = temp.newFolder("content-race-world").toPath();
+        Path file = write(world.resolve("level.dat"), "initial");
+        AtomicBoolean changed = new AtomicBoolean();
+        SnapshotScanner.InputStreamFactory noFollow =
+            SnapshotScanner.noFollowInputStreamFactory();
+        SnapshotScanner.FileHasher hasher = SnapshotScanner.streamingHasher(path ->
+            new FilterInputStream(noFollow.open(path)) {
+                @Override
+                public int read(byte[] bytes, int offset, int length) throws IOException {
+                    int count = super.read(bytes, offset, length);
+                    if (count > 0 && changed.compareAndSet(false, true)) {
+                        Files.write(file, "-changed".getBytes(StandardCharsets.UTF_8),
+                            StandardOpenOption.APPEND);
+                    }
+                    return count;
+                }
+            });
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new SnapshotScanner(hasher).scan(world, null, null,
+                new BackupCancellation()));
+
+        assertEquals("worldbackup.error.scan", error.getTranslationKey());
+        assertTrue(changed.get());
+        assertTrue(error.getCause() instanceof IOException);
     }
 
     @Test
@@ -339,7 +412,7 @@ public class SnapshotScannerTest {
         Path world = temp.newFolder("io-failure-world").toPath();
         write(world.resolve("level.dat"), "bytes");
         IOException failure = new IOException("simulated read failure");
-        SnapshotScanner scanner = new SnapshotScanner((path, cancellation) -> {
+        SnapshotScanner scanner = new SnapshotScanner((path, state, cancellation) -> {
             throw failure;
         });
 
@@ -355,7 +428,7 @@ public class SnapshotScannerTest {
     }
 
     private static SnapshotScanner countingScanner(AtomicInteger hashes) {
-        return new SnapshotScanner((path, cancellation) -> {
+        return new SnapshotScanner((path, state, cancellation) -> {
             hashes.incrementAndGet();
             return HASH_B;
         });

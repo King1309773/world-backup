@@ -12,8 +12,11 @@ import java.io.InterruptedIOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.EnumSet;
@@ -28,7 +31,7 @@ public final class SnapshotScanner {
     private final FileHasher hasher;
 
     public SnapshotScanner() {
-        this(streamingHasher(Files::newInputStream));
+        this(streamingHasher(noFollowInputStreamFactory()));
     }
 
     SnapshotScanner(FileHasher hasher) {
@@ -92,17 +95,20 @@ public final class SnapshotScanner {
                     throws IOException {
                 cancellation.check();
                 String relativePath = portableRelativePath(resolvedRoot, file);
+                BasicFileAttributes refreshedAttributes = Files.readAttributes(file,
+                    BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
                 Path contentPath = file;
-                BasicFileAttributes contentAttributes = attributes;
-                if (attributes.isSymbolicLink()) {
+                if (refreshedAttributes.isSymbolicLink()) {
                     contentPath = file.toRealPath();
                     try {
                         requireInsideWorld(resolvedRoot, contentPath, relativePath);
                     } catch (BackupException escape) {
                         throw new PathEscapeIOException(escape);
                     }
-                    contentAttributes = Files.readAttributes(contentPath,
-                        BasicFileAttributes.class);
+                } else if (attributes.isSymbolicLink()
+                        || attributes.isRegularFile() && !sameObservedFile(
+                            attributes, refreshedAttributes)) {
+                    throw new IOException("File changed while scanning: " + relativePath);
                 }
                 if ("session.lock".equals(relativePath)) {
                     return FileVisitResult.CONTINUE;
@@ -110,20 +116,23 @@ public final class SnapshotScanner {
                 if (exclusion != null && exclusion.test(relativePath)) {
                     return FileVisitResult.CONTINUE;
                 }
-                if (attributes.isSymbolicLink()) {
-                    if (contentAttributes.isDirectory()) {
+                if (refreshedAttributes.isSymbolicLink()) {
+                    BasicFileAttributes targetAttributes = Files.readAttributes(contentPath,
+                        BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    if (targetAttributes.isDirectory()) {
                         return FileVisitResult.CONTINUE;
                     }
-                    if (!contentAttributes.isRegularFile()) {
+                    if (!targetAttributes.isRegularFile()) {
                         throw new IOException("Symbolic link does not resolve to a regular file: "
                             + relativePath);
                     }
-                } else if (!attributes.isRegularFile()) {
+                } else if (!refreshedAttributes.isRegularFile()) {
                     return FileVisitResult.CONTINUE;
                 }
 
-                long size = contentAttributes.size();
-                long modifiedTimeMillis = contentAttributes.lastModifiedTime().toMillis();
+                FileState contentState = FileState.capture(contentPath);
+                long size = contentState.size;
+                long modifiedTimeMillis = contentState.modifiedTime.toMillis();
                 FileFingerprint oldFingerprint = previous == null
                     ? null : previous.get(relativePath);
                 String sha256;
@@ -131,7 +140,11 @@ public final class SnapshotScanner {
                         && oldFingerprint.getModifiedTimeMillis() == modifiedTimeMillis) {
                     sha256 = oldFingerprint.getSha256();
                 } else {
-                    sha256 = hasher.hash(contentPath, cancellation);
+                    sha256 = hasher.hash(contentPath, contentState, cancellation);
+                }
+                contentState.verify(contentPath);
+                if (refreshedAttributes.isSymbolicLink()) {
+                    verifyLinkStillResolvesInside(file, contentPath, resolvedRoot, relativePath);
                 }
                 files.put(relativePath,
                     new FileFingerprint(size, modifiedTimeMillis, sha256));
@@ -161,6 +174,39 @@ public final class SnapshotScanner {
         return PortablePaths.normalizeRelativePath(root.relativize(entry).toString());
     }
 
+    private static boolean sameObservedFile(BasicFileAttributes first,
+                                            BasicFileAttributes second) {
+        if (!first.isRegularFile() || !second.isRegularFile()
+                || first.size() != second.size()
+                || !first.lastModifiedTime().equals(second.lastModifiedTime())) {
+            return false;
+        }
+        Object firstKey = first.fileKey();
+        Object secondKey = second.fileKey();
+        return firstKey == null || secondKey == null || firstKey.equals(secondKey);
+    }
+
+    private static void verifyLinkStillResolvesInside(Path link, Path expectedTarget,
+                                                       Path resolvedRoot,
+                                                       String relativePath)
+            throws IOException {
+        BasicFileAttributes linkAttributes = Files.readAttributes(link,
+            BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!linkAttributes.isSymbolicLink()) {
+            throw new IOException("Symbolic link changed while scanning: " + relativePath);
+        }
+        Path currentTarget = link.toRealPath();
+        try {
+            requireInsideWorld(resolvedRoot, currentTarget, relativePath);
+        } catch (BackupException escape) {
+            throw new PathEscapeIOException(escape);
+        }
+        if (!currentTarget.equals(expectedTarget)) {
+            throw new IOException("Symbolic link target changed while scanning: "
+                + relativePath);
+        }
+    }
+
     static void requireInsideWorld(Path resolvedRoot, Path resolvedTarget, String relativePath)
             throws BackupException {
         Objects.requireNonNull(resolvedRoot, "resolvedRoot");
@@ -173,7 +219,7 @@ public final class SnapshotScanner {
 
     static FileHasher streamingHasher(InputStreamFactory streams) {
         Objects.requireNonNull(streams, "streams");
-        return (path, cancellation) -> {
+        return (path, expectedState, cancellation) -> {
             MessageDigest digest;
             try {
                 digest = MessageDigest.getInstance("SHA-256");
@@ -182,7 +228,9 @@ public final class SnapshotScanner {
             }
 
             byte[] buffer = new byte[HASH_BUFFER_SIZE];
+            expectedState.verify(path);
             try (InputStream input = streams.open(path)) {
+                expectedState.verify(path);
                 while (true) {
                     cancellation.check();
                     int count = input.read(buffer);
@@ -193,9 +241,15 @@ public final class SnapshotScanner {
                         digest.update(buffer, 0, count);
                     }
                 }
+                expectedState.verify(path);
             }
             return lowercaseHex(digest.digest());
         };
+    }
+
+    static InputStreamFactory noFollowInputStreamFactory() {
+        return path -> Files.newInputStream(path, StandardOpenOption.READ,
+            LinkOption.NOFOLLOW_LINKS);
     }
 
     private static String lowercaseHex(byte[] bytes) {
@@ -210,11 +264,52 @@ public final class SnapshotScanner {
     }
 
     interface FileHasher {
-        String hash(Path path, BackupCancellation cancellation) throws IOException;
+        String hash(Path path, FileState expectedState, BackupCancellation cancellation)
+            throws IOException;
     }
 
     interface InputStreamFactory {
         InputStream open(Path path) throws IOException;
+    }
+
+    static final class FileState {
+        private final Path realPath;
+        private final long size;
+        private final FileTime modifiedTime;
+        private final Object fileKey;
+
+        private FileState(Path realPath, BasicFileAttributes attributes) {
+            this.realPath = realPath;
+            this.size = attributes.size();
+            this.modifiedTime = attributes.lastModifiedTime();
+            this.fileKey = attributes.fileKey();
+        }
+
+        private static FileState capture(Path path) throws IOException {
+            BasicFileAttributes before = Files.readAttributes(path,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!before.isRegularFile()) {
+                throw new IOException("Hash target is not a regular file: " + path);
+            }
+            Path realPath = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            BasicFileAttributes after = Files.readAttributes(path,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!sameObservedFile(before, after)) {
+                throw new IOException("File changed while inspecting: " + path);
+            }
+            return new FileState(realPath, after);
+        }
+
+        private void verify(Path path) throws IOException {
+            FileState current = capture(path);
+            if (!realPath.equals(current.realPath)
+                    || size != current.size
+                    || !modifiedTime.equals(current.modifiedTime)
+                    || fileKey != null && current.fileKey != null
+                        && !fileKey.equals(current.fileKey)) {
+                throw new IOException("File changed while hashing: " + path);
+            }
+        }
     }
 
     private static final class PathEscapeIOException extends IOException {
