@@ -80,6 +80,7 @@ public final class SnapshotScanner {
                         throw new PathEscapeIOException(escape);
                     }
                     if (exclusion != null && exclusion.test(relativePath)) {
+                        FileState.validateContainment(directory, resolvedRoot, relativePath);
                         return FileVisitResult.SKIP_SUBTREE;
                     }
                     if (attributes.isOther() || Files.isSymbolicLink(directory)
@@ -114,6 +115,7 @@ public final class SnapshotScanner {
                     return FileVisitResult.CONTINUE;
                 }
                 if (exclusion != null && exclusion.test(relativePath)) {
+                    FileState.validateContainment(file, resolvedRoot, relativePath);
                     return FileVisitResult.CONTINUE;
                 }
                 if (refreshedAttributes.isSymbolicLink()) {
@@ -346,6 +348,7 @@ public final class SnapshotScanner {
             BasicFileAttributes attributes = Files.readAttributes(path,
                 BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
             requireLinkTargetInsideWorld(path, attributes, resolvedRoot, relativePath);
+            requireInsideWorldForRead(resolvedRoot, path.toRealPath(), relativePath);
         }
 
         private static Path resolveInsideWorld(Path path, Path resolvedRoot,

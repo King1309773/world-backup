@@ -202,6 +202,78 @@ public class SnapshotScannerTest {
     }
 
     @Test
+    public void excludedFileReplacedWithEscapingSymlinkReportsPathEscape() throws Exception {
+        Path world = temp.newFolder("excluded-file-race-world").toPath();
+        Path file = write(world.resolve("excluded.dat"), "inside");
+        Path outside = write(temp.newFile("excluded-file-secret.dat").toPath(), "secret");
+        Path probe = world.resolve("excluded-file-symlink-probe");
+        createSymbolicLinkOrSkip(probe, outside);
+        Files.delete(probe);
+        AtomicBoolean swapped = new AtomicBoolean();
+        AtomicInteger hashes = new AtomicInteger();
+        SnapshotScanner scanner = countingScanner(hashes);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> scanner.scan(world, null, relativePath -> {
+                if ("excluded.dat".equals(relativePath)
+                        && swapped.compareAndSet(false, true)) {
+                    try {
+                        Files.delete(file);
+                        Files.createSymbolicLink(file, outside);
+                    } catch (IOException failure) {
+                        throw new IllegalStateException(failure);
+                    }
+                    return true;
+                }
+                return false;
+            }, new BackupCancellation()));
+
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
+        assertTrue(swapped.get());
+        assertEquals(0, hashes.get());
+        assertEquals("secret", new String(Files.readAllBytes(outside),
+            StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void excludedDirectoryReplacedWithEscapingSymlinkReportsPathEscape()
+            throws Exception {
+        Path world = temp.newFolder("excluded-directory-race-world").toPath();
+        Path directory = Files.createDirectories(world.resolve("excluded"));
+        write(directory.resolve("inside.dat"), "inside");
+        Path movedDirectory = temp.getRoot().toPath().resolve("moved-excluded-directory");
+        Path outside = temp.newFolder("excluded-directory-race-outside").toPath();
+        write(outside.resolve("secret.dat"), "secret");
+        Path probe = world.resolve("excluded-directory-symlink-probe");
+        createSymbolicLinkOrSkip(probe, outside);
+        Files.delete(probe);
+        AtomicBoolean swapped = new AtomicBoolean();
+        AtomicInteger hashes = new AtomicInteger();
+        SnapshotScanner scanner = countingScanner(hashes);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> scanner.scan(world, null, relativePath -> {
+                if ("excluded".equals(relativePath)
+                        && swapped.compareAndSet(false, true)) {
+                    try {
+                        Files.move(directory, movedDirectory);
+                        Files.createSymbolicLink(directory, outside);
+                    } catch (IOException failure) {
+                        throw new IllegalStateException(failure);
+                    }
+                    return true;
+                }
+                return false;
+            }, new BackupCancellation()));
+
+        assertEquals("worldbackup.error.path_escape", error.getTranslationKey());
+        assertTrue(swapped.get());
+        assertEquals(0, hashes.get());
+        assertEquals("secret", new String(Files.readAllBytes(
+            outside.resolve("secret.dat")), StandardCharsets.UTF_8));
+    }
+
+    @Test
     public void cancellationBeforeScanPropagatesInterruptedIOException() throws Exception {
         Path world = temp.newFolder("cancelled-before-world").toPath();
         write(world.resolve("level.dat"), "bytes");
