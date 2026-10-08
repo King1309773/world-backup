@@ -20,8 +20,11 @@ import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.CopyOption;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -39,6 +42,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedInputStream;
 import java.util.zip.ZipEntry;
@@ -50,7 +54,36 @@ public final class ArchiveStore {
     private static final String MANIFEST_NAME = "manifest.json";
     private static final String DATA_PREFIX = "data/";
 
+    interface PublishOperations {
+        void move(Path source, Path target, CopyOption... options) throws IOException;
+
+        OutputStream newOutputStream(Path path, OpenOption... options) throws IOException;
+    }
+
+    private static final PublishOperations NIO_PUBLISH = new PublishOperations() {
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            Files.move(source, target, options);
+        }
+
+        @Override
+        public OutputStream newOutputStream(Path path, OpenOption... options)
+                throws IOException {
+            return Files.newOutputStream(path, options);
+        }
+    };
+
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    private final PublishOperations publishOperations;
+
+    public ArchiveStore() {
+        this(NIO_PUBLISH);
+    }
+
+    ArchiveStore(PublishOperations publishOperations) {
+        this.publishOperations = Objects.requireNonNull(publishOperations,
+            "publishOperations");
+    }
 
     public Path write(Path repo, String archiveName, Path worldRoot,
                       SnapshotManifest manifest, List<String> includedPaths,
@@ -196,34 +229,160 @@ public final class ArchiveStore {
         return entry;
     }
 
-    private static void copy(Path source, OutputStream output,
-                             BackupCancellation cancellation) throws IOException {
+    private static PayloadFingerprint copy(Path source, OutputStream output,
+                                           BackupCancellation cancellation)
+            throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
+        MessageDigest digest = sha256();
+        long size = 0L;
         try (InputStream input = Files.newInputStream(source, StandardOpenOption.READ,
                 LinkOption.NOFOLLOW_LINKS)) {
             int count;
             while ((count = input.read(buffer)) != -1) {
                 cancellation.check();
                 output.write(buffer, 0, count);
+                digest.update(buffer, 0, count);
+                size += count;
             }
             cancellation.check();
         }
+        return new PayloadFingerprint(size, lowercaseHex(digest.digest()));
     }
 
-    private static void publishVerified(Path verifiedArchive, Path target,
-                                        BackupCancellation cancellation)
+    private void publishVerified(Path verifiedArchive, Path target,
+                                 BackupCancellation cancellation)
             throws IOException {
         cancellation.check();
         try {
-            Files.move(verifiedArchive, target, StandardCopyOption.ATOMIC_MOVE,
+            publishOperations.move(verifiedArchive, target, StandardCopyOption.ATOMIC_MOVE,
                 StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException unsupported) {
-            Path publishTemp = target.resolveSibling(target.getFileName().toString() + ".tmp");
-            AtomicFiles.write(target, output -> {
-                copy(verifiedArchive, output, cancellation);
-                output.flush();
-                validateZip(publishTemp, cancellation);
-            });
+            publishVerifiedWithoutAtomicMove(verifiedArchive, target, cancellation);
+        }
+    }
+
+    private void publishVerifiedWithoutAtomicMove(Path verifiedArchive, Path target,
+                                                  BackupCancellation cancellation)
+            throws IOException {
+        Path parent = target.toAbsolutePath().normalize().getParent();
+        Path publishTemp = null;
+        Path rollback = null;
+        boolean moveAttempted = false;
+        try {
+            publishTemp = copyToUniqueFile(verifiedArchive, parent, ".publish",
+                cancellation);
+            PublishFileState publishState = PublishFileState.capture(publishTemp);
+            validateZip(publishTemp, cancellation);
+            publishState.verifyUnchanged();
+
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                PublishFileState targetState = PublishFileState.capture(target);
+                rollback = copyToUniqueFile(target, parent, ".rollback", cancellation);
+                targetState.verifyUnchanged();
+            }
+
+            cancellation.check();
+            publishState.verifyUnchanged();
+            moveAttempted = true;
+            publishOperations.move(publishTemp, target, StandardCopyOption.REPLACE_EXISTING);
+            publishTemp = null;
+            cancellation.check();
+
+            if (rollback != null) {
+                Files.delete(rollback);
+                rollback = null;
+            }
+        } catch (IOException | RuntimeException | Error failure) {
+            if (moveAttempted) {
+                try {
+                    if (rollback != null) {
+                        publishOperations.move(rollback, target,
+                            StandardCopyOption.REPLACE_EXISTING);
+                        rollback = null;
+                    } else if (publishTemp == null
+                            || !Files.exists(publishTemp, LinkOption.NOFOLLOW_LINKS)) {
+                        Files.deleteIfExists(target);
+                    }
+                } catch (IOException restoreFailure) {
+                    Path recoveryPath = rollback == null ? target : rollback;
+                    IOException recovery = new IOException(failure.getMessage()
+                        + "; publish recovery requires attention at "
+                        + recoveryPath.toAbsolutePath().normalize(), failure);
+                    recovery.addSuppressed(restoreFailure);
+                    cleanupPublishTemp(publishTemp, recovery);
+                    throw recovery;
+                }
+            }
+            cleanupPublishTemp(publishTemp, failure);
+            cleanupPublishTemp(rollback, failure);
+            throw failure;
+        }
+        cleanupPublishTemp(publishTemp, null);
+        cleanupPublishTemp(rollback, null);
+    }
+
+    private Path copyToUniqueFile(Path source, Path parent, String suffix,
+                                  BackupCancellation cancellation) throws IOException {
+        for (int attempt = 0; attempt < 100; attempt++) {
+            Path candidate = parent.resolve(".wba-" + UUID.randomUUID() + suffix);
+            OutputStream output;
+            try {
+                output = publishOperations.newOutputStream(candidate,
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS);
+            } catch (FileAlreadyExistsException occupied) {
+                continue;
+            }
+
+            try {
+                PayloadFingerprint copied;
+                try (OutputStream opened = output) {
+                    copied = copy(source, opened, cancellation);
+                    opened.flush();
+                }
+                PublishFileState state = PublishFileState.capture(candidate);
+                state.verifyIdentity();
+                PayloadFingerprint stored = fingerprintFile(candidate, cancellation);
+                if (!sameFingerprint(copied, stored)) {
+                    throw new IOException("Publish temporary file changed after writing: "
+                        + candidate);
+                }
+                return candidate;
+            } catch (IOException | RuntimeException | Error failure) {
+                cleanupPublishTemp(candidate, failure);
+                throw failure;
+            }
+        }
+        throw new IOException("Unable to allocate a unique publish temporary file in "
+            + parent);
+    }
+
+    private static PayloadFingerprint fingerprintFile(Path file,
+                                                      BackupCancellation cancellation)
+            throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        try (InputStream input = Files.newInputStream(file, StandardOpenOption.READ,
+                LinkOption.NOFOLLOW_LINKS)) {
+            return fingerprint(input, buffer, cancellation);
+        }
+    }
+
+    private static boolean sameFingerprint(PayloadFingerprint first,
+                                           PayloadFingerprint second) {
+        return first.size == second.size && first.sha256.equals(second.sha256);
+    }
+
+    private static void cleanupPublishTemp(Path path, Throwable failure) throws IOException {
+        if (path == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException cleanupFailure) {
+            if (failure == null) {
+                throw cleanupFailure;
+            }
+            failure.addSuppressed(cleanupFailure);
         }
     }
 
@@ -737,6 +896,61 @@ public final class ArchiveStore {
         private PayloadFingerprint(long size, String sha256) {
             this.size = size;
             this.sha256 = sha256;
+        }
+    }
+
+    private static final class PublishFileState {
+        private final Path path;
+        private final long size;
+        private final long modifiedTimeMillis;
+        private final Object fileKey;
+
+        private PublishFileState(Path path, BasicFileAttributes attributes) {
+            this.path = path;
+            this.size = attributes.size();
+            this.modifiedTimeMillis = attributes.lastModifiedTime().toMillis();
+            this.fileKey = attributes.fileKey();
+        }
+
+        private static PublishFileState capture(Path path) throws IOException {
+            Path absolute = path.toAbsolutePath().normalize();
+            BasicFileAttributes attributes = Files.readAttributes(absolute,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attributes.isRegularFile() || attributes.isSymbolicLink()
+                    || !absolute.toRealPath().equals(absolute)) {
+                throw new IOException("Publish path is not an unsymbolic regular file: "
+                    + absolute);
+            }
+            return new PublishFileState(absolute, attributes);
+        }
+
+        private void verifyIdentity() throws IOException {
+            BasicFileAttributes current = currentAttributes();
+            if (fileKey != null && current.fileKey() != null
+                    && !fileKey.equals(current.fileKey())) {
+                throw new IOException("Publish path identity changed: " + path);
+            }
+        }
+
+        private void verifyUnchanged() throws IOException {
+            BasicFileAttributes current = currentAttributes();
+            if (current.size() != size
+                    || current.lastModifiedTime().toMillis() != modifiedTimeMillis
+                    || fileKey != null && current.fileKey() != null
+                        && !fileKey.equals(current.fileKey())) {
+                throw new IOException("Existing archive changed during publish: " + path);
+            }
+        }
+
+        private BasicFileAttributes currentAttributes() throws IOException {
+            BasicFileAttributes current = Files.readAttributes(path,
+                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!current.isRegularFile() || current.isSymbolicLink()
+                    || !path.toRealPath().equals(path)) {
+                throw new IOException("Publish path is no longer an unsymbolic regular file: "
+                    + path);
+            }
+            return current;
         }
     }
 

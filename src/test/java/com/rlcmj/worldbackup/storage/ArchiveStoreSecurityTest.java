@@ -13,12 +13,18 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -186,6 +192,133 @@ public class ArchiveStoreSecurityTest {
             assertEquals(0L, files.count());
         }
         assertFalse(Files.exists(directory.resolve("escape.zip")));
+    }
+
+    @Test
+    public void fallbackDoesNotFollowPreexistingFixedPublishTempSymlink() throws Exception {
+        Path directory = temp.newFolder("fallback-symlink").toPath();
+        Path world = Files.createDirectories(directory.resolve("world"));
+        write(world.resolve("level.dat"), "level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path canary = write(directory.resolve("outside-canary"), "untouched");
+        Path fixedTemp = repo.resolve("backup.zip.tmp");
+        try {
+            Files.createSymbolicLink(fixedTemp, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        Path archive = new ArchiveStore(new ForcedFallbackOperations(null, false)).write(
+            repo, "backup.zip", world, snapshot, Collections.singletonList("level.dat"),
+            Collections.emptyList(), new BackupCancellation());
+
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertTrue(Files.isSymbolicLink(fixedTemp));
+        assertEquals(snapshot, new ArchiveStore().readManifest(archive));
+    }
+
+    @Test
+    public void fallbackDoesNotTruncatePreexistingFixedPublishTempHardlink() throws Exception {
+        Path directory = temp.newFolder("fallback-hardlink").toPath();
+        Path world = Files.createDirectories(directory.resolve("world"));
+        write(world.resolve("level.dat"), "level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path canary = write(directory.resolve("outside-canary"), "untouched");
+        Path fixedTemp = repo.resolve("backup.zip.tmp");
+        try {
+            Files.createLink(fixedTemp, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Hard links are unavailable", unavailable);
+        }
+
+        Path archive = new ArchiveStore(new ForcedFallbackOperations(null, false)).write(
+            repo, "backup.zip", world, snapshot, Collections.singletonList("level.dat"),
+            Collections.emptyList(), new BackupCancellation());
+
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertTrue(Files.isSameFile(fixedTemp, canary));
+        assertEquals(snapshot, new ArchiveStore().readManifest(archive));
+    }
+
+    @Test
+    public void cancellationDuringFallbackCopyPreservesOldFinalAndCleansUniqueTemps()
+            throws Exception {
+        Path world = temp.newFolder("fallback-cancel-world").toPath();
+        write(world.resolve("level.dat"), repeat('x', 20000));
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = temp.newFolder("fallback-cancel-repo").toPath();
+        Path existing = write(repo.resolve("backup.zip"), "old archive");
+        BackupCancellation cancellation = new BackupCancellation();
+        ArchiveStore store = new ArchiveStore(
+            new ForcedFallbackOperations(cancellation, true));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.write(repo, "backup.zip", world, snapshot,
+                Collections.singletonList("level.dat"), Collections.emptyList(),
+                cancellation));
+
+        assertEquals("worldbackup.error.cancelled", error.getTranslationKey());
+        assertEquals("old archive", new String(Files.readAllBytes(existing),
+            StandardCharsets.UTF_8));
+        try (java.util.stream.Stream<Path> files = Files.list(repo)) {
+            assertEquals(Collections.singletonList("backup.zip"), files
+                .map(path -> path.getFileName().toString())
+                .sorted()
+                .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    public void cancellationDuringFallbackCopyLeavesNoNewFinalOrUniqueTemps()
+            throws Exception {
+        Path world = temp.newFolder("fallback-cancel-new-world").toPath();
+        write(world.resolve("level.dat"), repeat('x', 20000));
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = temp.newFolder("fallback-cancel-new-repo").toPath();
+        BackupCancellation cancellation = new BackupCancellation();
+        ArchiveStore store = new ArchiveStore(
+            new ForcedFallbackOperations(cancellation, true));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.write(repo, "backup.zip", world, snapshot,
+                Collections.singletonList("level.dat"), Collections.emptyList(),
+                cancellation));
+
+        assertEquals("worldbackup.error.cancelled", error.getTranslationKey());
+        try (java.util.stream.Stream<Path> files = Files.list(repo)) {
+            assertEquals(0L, files.count());
+        }
+    }
+
+    @Test
+    public void failedFallbackReplacementPreservesOldFinalAndCleansUniqueTemps()
+            throws Exception {
+        Path world = temp.newFolder("fallback-failure-world").toPath();
+        write(world.resolve("level.dat"), "level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = temp.newFolder("fallback-failure-repo").toPath();
+        Path existing = write(repo.resolve("backup.zip"), "old archive");
+        ArchiveStore store = new ArchiveStore(
+            new ForcedFallbackOperations(null, false, true));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.write(repo, "backup.zip", world, snapshot,
+                Collections.singletonList("level.dat"), Collections.emptyList(),
+                new BackupCancellation()));
+
+        assertEquals("worldbackup.error.archive_write", error.getTranslationKey());
+        assertEquals("old archive", new String(Files.readAllBytes(existing),
+            StandardCharsets.UTF_8));
+        try (java.util.stream.Stream<Path> files = Files.list(repo)) {
+            assertEquals(Collections.singletonList("backup.zip"), files
+                .map(path -> path.getFileName().toString())
+                .sorted()
+                .collect(java.util.stream.Collectors.toList()));
+        }
     }
 
     @Test
@@ -566,5 +699,70 @@ public class ArchiveStoreSecurityTest {
         }
         assertTrue("Expected duplicate name in local header and central directory",
             replacements >= 2);
+    }
+
+    private static final class ForcedFallbackOperations
+            implements ArchiveStore.PublishOperations {
+        private final BackupCancellation cancellation;
+        private final boolean cancelDuringPublishCopy;
+        private final boolean failReplacementMove;
+        private boolean rejectedAtomicMove;
+
+        private ForcedFallbackOperations(BackupCancellation cancellation,
+                                         boolean cancelDuringPublishCopy) {
+            this(cancellation, cancelDuringPublishCopy, false);
+        }
+
+        private ForcedFallbackOperations(BackupCancellation cancellation,
+                                         boolean cancelDuringPublishCopy,
+                                         boolean failReplacementMove) {
+            this.cancellation = cancellation;
+            this.cancelDuringPublishCopy = cancelDuringPublishCopy;
+            this.failReplacementMove = failReplacementMove;
+        }
+
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            if (!rejectedAtomicMove && Arrays.asList(options).contains(
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE)) {
+                rejectedAtomicMove = true;
+                throw new AtomicMoveNotSupportedException(source.toString(),
+                    target.toString(), "forced by test");
+            }
+            if (failReplacementMove
+                    && source.getFileName().toString().endsWith(".publish")) {
+                throw new IOException("forced fallback replacement failure");
+            }
+            Files.move(source, target, options);
+        }
+
+        @Override
+        public OutputStream newOutputStream(Path path, OpenOption... options)
+                throws IOException {
+            List<OpenOption> requested = Arrays.asList(options);
+            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+                    || !requested.contains(StandardOpenOption.CREATE_NEW)
+                    || !requested.contains(StandardOpenOption.WRITE)
+                    || !requested.contains(LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("publish temp was not opened with CREATE_NEW and NOFOLLOW");
+            }
+            OutputStream delegate = Files.newOutputStream(path, options);
+            if (!cancelDuringPublishCopy
+                    || !path.getFileName().toString().endsWith(".publish")) {
+                return delegate;
+            }
+            return new FilterOutputStream(delegate) {
+                private boolean cancelled;
+
+                @Override
+                public void write(byte[] buffer, int offset, int length) throws IOException {
+                    out.write(buffer, offset, length);
+                    if (!cancelled) {
+                        cancelled = true;
+                        cancellation.cancel();
+                    }
+                }
+            };
+        }
     }
 }
