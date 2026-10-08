@@ -58,6 +58,8 @@ public final class ArchiveStore {
         void move(Path source, Path target, CopyOption... options) throws IOException;
 
         OutputStream newOutputStream(Path path, OpenOption... options) throws IOException;
+
+        void beforeFallbackMove(Path source) throws IOException;
     }
 
     private static final PublishOperations NIO_PUBLISH = new PublishOperations() {
@@ -70,6 +72,11 @@ public final class ArchiveStore {
         public OutputStream newOutputStream(Path path, OpenOption... options)
                 throws IOException {
             return Files.newOutputStream(path, options);
+        }
+
+        @Override
+        public void beforeFallbackMove(Path source) {
+            // Test seam. Production publishing has no work between final verification and move.
         }
     };
 
@@ -116,9 +123,10 @@ public final class ArchiveStore {
             writeZip(staging, resolvedRoot, safeManifest, included,
                 encodedManifest, cancellation);
             validateZip(staging, cancellation);
+            ArchiveBaseline verifiedBaseline = ArchiveBaseline.capture(staging, cancellation);
 
             Path verifiedArchive = staging;
-            publishVerified(verifiedArchive, target, cancellation);
+            publishVerified(verifiedArchive, target, verifiedBaseline, cancellation);
             return target;
         } catch (InterruptedIOException failure) {
             throw new BackupException("worldbackup.error.cancelled", failure);
@@ -250,6 +258,7 @@ public final class ArchiveStore {
     }
 
     private void publishVerified(Path verifiedArchive, Path target,
+                                 ArchiveBaseline verifiedBaseline,
                                  BackupCancellation cancellation)
             throws IOException {
         cancellation.check();
@@ -257,32 +266,42 @@ public final class ArchiveStore {
             publishOperations.move(verifiedArchive, target, StandardCopyOption.ATOMIC_MOVE,
                 StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException unsupported) {
-            publishVerifiedWithoutAtomicMove(verifiedArchive, target, cancellation);
+            publishVerifiedWithoutAtomicMove(verifiedArchive, target, verifiedBaseline,
+                cancellation);
         }
     }
 
     private void publishVerifiedWithoutAtomicMove(Path verifiedArchive, Path target,
+                                                  ArchiveBaseline verifiedBaseline,
                                                   BackupCancellation cancellation)
             throws IOException {
         Path parent = target.toAbsolutePath().normalize().getParent();
         Path publishTemp = null;
         Path rollback = null;
+        ArchiveBaseline rollbackBaseline = null;
         boolean moveAttempted = false;
         try {
-            publishTemp = copyToUniqueFile(verifiedArchive, parent, ".publish",
-                cancellation);
-            PublishFileState publishState = PublishFileState.capture(publishTemp);
+            verifiedBaseline.verify(cancellation);
+            PreparedFile publish = copyToUniqueFile(verifiedArchive, verifiedBaseline,
+                parent, ".publish", cancellation);
+            publishTemp = publish.path;
             validateZip(publishTemp, cancellation);
-            publishState.verifyUnchanged();
+            publish.baseline.verifyMatches(verifiedBaseline.fingerprint, cancellation);
 
             if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
-                PublishFileState targetState = PublishFileState.capture(target);
-                rollback = copyToUniqueFile(target, parent, ".rollback", cancellation);
-                targetState.verifyUnchanged();
+                ArchiveBaseline targetBaseline = ArchiveBaseline.capture(target,
+                    cancellation);
+                PreparedFile saved = copyToUniqueFile(target, targetBaseline, parent,
+                    ".rollback", cancellation);
+                rollback = saved.path;
+                rollbackBaseline = saved.baseline;
+                targetBaseline.verify(cancellation);
             }
 
             cancellation.check();
-            publishState.verifyUnchanged();
+            publish.baseline.verifyMatches(verifiedBaseline.fingerprint, cancellation);
+            publishOperations.beforeFallbackMove(publishTemp);
+            publish.baseline.verifyMatches(verifiedBaseline.fingerprint, cancellation);
             moveAttempted = true;
             publishOperations.move(publishTemp, target, StandardCopyOption.REPLACE_EXISTING);
             publishTemp = null;
@@ -296,6 +315,7 @@ public final class ArchiveStore {
             if (moveAttempted) {
                 try {
                     if (rollback != null) {
+                        rollbackBaseline.verify(null);
                         publishOperations.move(rollback, target,
                             StandardCopyOption.REPLACE_EXISTING);
                         rollback = null;
@@ -321,8 +341,9 @@ public final class ArchiveStore {
         cleanupPublishTemp(rollback, null);
     }
 
-    private Path copyToUniqueFile(Path source, Path parent, String suffix,
-                                  BackupCancellation cancellation) throws IOException {
+    private PreparedFile copyToUniqueFile(Path source, ArchiveBaseline sourceBaseline,
+                                          Path parent, String suffix,
+                                          BackupCancellation cancellation) throws IOException {
         for (int attempt = 0; attempt < 100; attempt++) {
             Path candidate = parent.resolve(".wba-" + UUID.randomUUID() + suffix);
             OutputStream output;
@@ -335,19 +356,24 @@ public final class ArchiveStore {
             }
 
             try {
+                sourceBaseline.verify(cancellation);
                 PayloadFingerprint copied;
                 try (OutputStream opened = output) {
                     copied = copy(source, opened, cancellation);
                     opened.flush();
                 }
-                PublishFileState state = PublishFileState.capture(candidate);
-                state.verifyIdentity();
-                PayloadFingerprint stored = fingerprintFile(candidate, cancellation);
-                if (!sameFingerprint(copied, stored)) {
+                sourceBaseline.verify(cancellation);
+                if (!sameFingerprint(copied, sourceBaseline.fingerprint)) {
+                    throw new IOException("Publish source changed while copying: " + source);
+                }
+                ArchiveBaseline candidateBaseline = ArchiveBaseline.capture(candidate,
+                    cancellation);
+                if (!sameFingerprint(candidateBaseline.fingerprint,
+                        sourceBaseline.fingerprint)) {
                     throw new IOException("Publish temporary file changed after writing: "
                         + candidate);
                 }
-                return candidate;
+                return new PreparedFile(candidate, candidateBaseline);
             } catch (IOException | RuntimeException | Error failure) {
                 cleanupPublishTemp(candidate, failure);
                 throw failure;
@@ -951,6 +977,49 @@ public final class ArchiveStore {
                     + path);
             }
             return current;
+        }
+    }
+
+    private static final class ArchiveBaseline {
+        private final PublishFileState state;
+        private final PayloadFingerprint fingerprint;
+
+        private ArchiveBaseline(PublishFileState state, PayloadFingerprint fingerprint) {
+            this.state = state;
+            this.fingerprint = fingerprint;
+        }
+
+        private static ArchiveBaseline capture(Path path,
+                                               BackupCancellation cancellation)
+                throws IOException {
+            PublishFileState state = PublishFileState.capture(path);
+            PayloadFingerprint fingerprint = fingerprintFile(path, cancellation);
+            state.verifyUnchanged();
+            return new ArchiveBaseline(state, fingerprint);
+        }
+
+        private void verify(BackupCancellation cancellation) throws IOException {
+            verifyMatches(fingerprint, cancellation);
+        }
+
+        private void verifyMatches(PayloadFingerprint expected,
+                                   BackupCancellation cancellation) throws IOException {
+            state.verifyUnchanged();
+            PayloadFingerprint current = fingerprintFile(state.path, cancellation);
+            state.verifyUnchanged();
+            if (!sameFingerprint(current, expected)) {
+                throw new IOException("Archive content changed during publish: " + state.path);
+            }
+        }
+    }
+
+    private static final class PreparedFile {
+        private final Path path;
+        private final ArchiveBaseline baseline;
+
+        private PreparedFile(Path path, ArchiveBaseline baseline) {
+            this.path = path;
+            this.baseline = baseline;
         }
     }
 

@@ -25,6 +25,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -304,6 +305,81 @@ public class ArchiveStoreSecurityTest {
         Path existing = write(repo.resolve("backup.zip"), "old archive");
         ArchiveStore store = new ArchiveStore(
             new ForcedFallbackOperations(null, false, true));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.write(repo, "backup.zip", world, snapshot,
+                Collections.singletonList("level.dat"), Collections.emptyList(),
+                new BackupCancellation()));
+
+        assertEquals("worldbackup.error.archive_write", error.getTranslationKey());
+        assertEquals("old archive", new String(Files.readAllBytes(existing),
+            StandardCharsets.UTF_8));
+        try (java.util.stream.Stream<Path> files = Files.list(repo)) {
+            assertEquals(Collections.singletonList("backup.zip"), files
+                .map(path -> path.getFileName().toString())
+                .sorted()
+                .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    public void fallbackRejectsArchiveReplacedByAtomicMoveAttempt() throws Exception {
+        Path directory = temp.newFolder("fallback-source-replacement").toPath();
+        Path world = Files.createDirectories(directory.resolve("world"));
+        write(world.resolve("level.dat"), "expected level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+
+        Path attackerWorld = Files.createDirectories(directory.resolve("attacker-world"));
+        write(attackerWorld.resolve("level.dat"), "different valid level");
+        SnapshotManifest attackerSnapshot = manifest(attackerWorld, "level.dat");
+        Path attackerRepo = Files.createDirectories(directory.resolve("attacker-repo"));
+        Path replacement = new ArchiveStore().write(attackerRepo, "replacement.zip",
+            attackerWorld, attackerSnapshot, Collections.singletonList("level.dat"),
+            Collections.emptyList(), new BackupCancellation());
+
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path existing = write(repo.resolve("backup.zip"), "old archive");
+        ArchiveStore store = new ArchiveStore(
+            new ForcedFallbackOperations(null, false, false, replacement));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> store.write(repo, "backup.zip", world, snapshot,
+                Collections.singletonList("level.dat"), Collections.emptyList(),
+                new BackupCancellation()));
+
+        assertEquals("worldbackup.error.archive_write", error.getTranslationKey());
+        assertEquals("old archive", new String(Files.readAllBytes(existing),
+            StandardCharsets.UTF_8));
+        try (java.util.stream.Stream<Path> files = Files.list(repo)) {
+            assertEquals(Collections.singletonList("backup.zip"), files
+                .map(path -> path.getFileName().toString())
+                .sorted()
+                .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    public void fallbackRejectsCandidateChangedThroughHardlinkAfterValidation()
+            throws Exception {
+        Path directory = temp.newFolder("fallback-candidate-hardlink-change").toPath();
+        Path probe = write(directory.resolve("hardlink-probe"), "probe");
+        Path probeLink = directory.resolve("hardlink-probe-link");
+        try {
+            Files.createLink(probeLink, probe);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Hard links are unavailable", unavailable);
+        } finally {
+            Files.deleteIfExists(probeLink);
+            Files.deleteIfExists(probe);
+        }
+
+        Path world = Files.createDirectories(directory.resolve("world"));
+        write(world.resolve("level.dat"), "expected level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path existing = write(repo.resolve("backup.zip"), "old archive");
+        ArchiveStore store = new ArchiveStore(
+            new ForcedFallbackOperations(null, false, false, null, true));
 
         BackupException error = assertThrows(BackupException.class,
             () -> store.write(repo, "backup.zip", world, snapshot,
@@ -706,6 +782,8 @@ public class ArchiveStoreSecurityTest {
         private final BackupCancellation cancellation;
         private final boolean cancelDuringPublishCopy;
         private final boolean failReplacementMove;
+        private final Path atomicMoveReplacement;
+        private final boolean tamperCandidateBeforeMove;
         private boolean rejectedAtomicMove;
 
         private ForcedFallbackOperations(BackupCancellation cancellation,
@@ -716,9 +794,27 @@ public class ArchiveStoreSecurityTest {
         private ForcedFallbackOperations(BackupCancellation cancellation,
                                          boolean cancelDuringPublishCopy,
                                          boolean failReplacementMove) {
+            this(cancellation, cancelDuringPublishCopy, failReplacementMove, null);
+        }
+
+        private ForcedFallbackOperations(BackupCancellation cancellation,
+                                         boolean cancelDuringPublishCopy,
+                                         boolean failReplacementMove,
+                                         Path atomicMoveReplacement) {
+            this(cancellation, cancelDuringPublishCopy, failReplacementMove,
+                atomicMoveReplacement, false);
+        }
+
+        private ForcedFallbackOperations(BackupCancellation cancellation,
+                                         boolean cancelDuringPublishCopy,
+                                         boolean failReplacementMove,
+                                         Path atomicMoveReplacement,
+                                         boolean tamperCandidateBeforeMove) {
             this.cancellation = cancellation;
             this.cancelDuringPublishCopy = cancelDuringPublishCopy;
             this.failReplacementMove = failReplacementMove;
+            this.atomicMoveReplacement = atomicMoveReplacement;
+            this.tamperCandidateBeforeMove = tamperCandidateBeforeMove;
         }
 
         @Override
@@ -726,6 +822,10 @@ public class ArchiveStoreSecurityTest {
             if (!rejectedAtomicMove && Arrays.asList(options).contains(
                     java.nio.file.StandardCopyOption.ATOMIC_MOVE)) {
                 rejectedAtomicMove = true;
+                if (atomicMoveReplacement != null) {
+                    Files.move(atomicMoveReplacement, source,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
                 throw new AtomicMoveNotSupportedException(source.toString(),
                     target.toString(), "forced by test");
             }
@@ -763,6 +863,23 @@ public class ArchiveStoreSecurityTest {
                     }
                 }
             };
+        }
+
+        @Override
+        public void beforeFallbackMove(Path source) throws IOException {
+            if (!tamperCandidateBeforeMove) {
+                return;
+            }
+            Path alias = source.resolveSibling("candidate-hardlink-alias");
+            FileTime modified = Files.getLastModifiedTime(source, LinkOption.NOFOLLOW_LINKS);
+            Files.createLink(alias, source);
+            try (java.nio.channels.SeekableByteChannel channel = Files.newByteChannel(alias,
+                    StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
+                channel.write(java.nio.ByteBuffer.wrap(new byte[] {'X'}));
+            } finally {
+                Files.setLastModifiedTime(source, modified);
+                Files.deleteIfExists(alias);
+            }
         }
     }
 }
