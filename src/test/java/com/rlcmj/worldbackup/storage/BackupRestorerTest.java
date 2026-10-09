@@ -357,6 +357,23 @@ public class BackupRestorerTest {
     }
 
     @Test
+    public void promotionFailureBeforeMoveWithoutOriginalIsSwapFailureAndCleansTemporary()
+            throws Exception {
+        Fixture fixture = fixture(false);
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new InjectedMoves(InjectedMoves.Failure.PROMOTION))
+                .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                    chain.v3.getId()));
+
+        assertEquals("worldbackup.error.restore_swap", error.getTranslationKey());
+        assertFalse(Files.exists(fixture.world, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
     public void safetyMoveFailureLeavesOriginalUntouchedAndCleansTemporaryWorld()
             throws Exception {
         Fixture fixture = fixture();
@@ -543,6 +560,50 @@ public class BackupRestorerTest {
             .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
         assertTrue(Files.isDirectory(fixture.savesDir.resolve("World1"),
             LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void invalidTemporaryRecoveryIsSkippedInFavorOfValidOriginalSafetyCopy()
+            throws Exception {
+        for (RecoveryDamage damage : Arrays.asList(RecoveryDamage.TEMP_DAMAGED,
+                RecoveryDamage.TEMP_LINK, RecoveryDamage.TEMP_DELETED)) {
+            Fixture fixture = fixture();
+            Chain chain = fixture.chain(true);
+            Path safety = fixture.gameDir.resolve("restore-safety")
+                .resolve("World1-20261009-010203-004").toAbsolutePath().normalize();
+
+            BackupException error = assertThrows(BackupException.class,
+                () -> fixture.restorer(new RecoveryDamageOperations(fixture, damage))
+                    .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                        chain.v3.getId()));
+
+            assertEquals(damage.name(), "worldbackup.error.restore_rollback",
+                error.getTranslationKey());
+            assertEquals(damage.name(), safety.toString(), error.getArguments()[0]);
+            assertArrayEquals(bytes("current"),
+                Files.readAllBytes(safety.resolve("current.dat")));
+        }
+    }
+
+    @Test
+    public void invalidSafetyCopyIsNotReportedAsRecovery() throws Exception {
+        for (RecoveryDamage damage : Arrays.asList(RecoveryDamage.SAFETY_LINK,
+                RecoveryDamage.SAFETY_DAMAGED)) {
+            Fixture fixture = fixture();
+            Chain chain = fixture.chain(true);
+
+            BackupException error = assertThrows(BackupException.class,
+                () -> fixture.restorer(new RecoveryDamageOperations(fixture, damage))
+                    .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                        chain.v3.getId()));
+
+            assertEquals(damage.name(), "worldbackup.error.restore_rollback",
+                error.getTranslationKey());
+            assertEquals(damage.name(), 0, error.getArguments().length);
+            assertNotNull(damage.name(), error.getCause());
+            assertTrue(damage.name(),
+                error.getCause().getMessage().contains("no recovery path"));
+        }
     }
 
     @Test
@@ -887,6 +948,82 @@ public class BackupRestorerTest {
     }
 
     private enum MoveStage { SAFETY, PROMOTION, ROLLBACK }
+
+    private enum RecoveryDamage {
+        TEMP_DAMAGED, TEMP_LINK, TEMP_DELETED, SAFETY_LINK, SAFETY_DAMAGED
+    }
+
+    private static final class RecoveryDamageOperations
+            implements BackupRestorer.MoveOperations {
+        private final Fixture fixture;
+        private final RecoveryDamage damage;
+
+        private RecoveryDamageOperations(Fixture fixture, RecoveryDamage damage) {
+            this.fixture = fixture;
+            this.damage = damage;
+        }
+
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(),
+                    "exercise fallback");
+            }
+            boolean promotion = source.toString().contains("worldbackup-tmp");
+            boolean rollback = source.toString().contains("restore-safety");
+            if (promotion) {
+                Files.createDirectory(target);
+                write(target.resolve("unknown.dat"), "unknown");
+                damageRecoverySource(source);
+                throw new IOException("injected ambiguous promotion with " + damage);
+            }
+            if (rollback && damage == RecoveryDamage.TEMP_DELETED) {
+                throw new IOException("injected rollback failure");
+            }
+            Files.move(source, target, options);
+        }
+
+        private void damageRecoverySource(Path temporary) throws IOException {
+            if (damage == RecoveryDamage.TEMP_DAMAGED
+                    || damage == RecoveryDamage.SAFETY_LINK
+                    || damage == RecoveryDamage.SAFETY_DAMAGED) {
+                Files.write(temporary.resolve("level.dat"), bytes("damaged"));
+            } else {
+                Files.delete(temporary.resolve("level.dat"));
+                Files.delete(temporary.resolve("added.dat"));
+                Files.delete(temporary);
+                if (damage == RecoveryDamage.TEMP_LINK) {
+                    Path target = Files.createDirectory(fixture.gameDir.resolve(
+                        "invalid-temp-link-target"));
+                    createSymbolicLinkOrSkip(temporary, target);
+                }
+            }
+            if (damage == RecoveryDamage.SAFETY_LINK) {
+                Path safety = fixture.gameDir.resolve("restore-safety")
+                    .resolve("World1-20261009-010203-004");
+                Files.delete(safety.resolve("current.dat"));
+                Files.delete(safety);
+                Path target = Files.createDirectory(fixture.gameDir.resolve(
+                    "invalid-safety-link-target"));
+                createSymbolicLinkOrSkip(safety, target);
+            } else if (damage == RecoveryDamage.SAFETY_DAMAGED) {
+                Path safety = fixture.gameDir.resolve("restore-safety")
+                    .resolve("World1-20261009-010203-004");
+                Files.write(safety.resolve("current.dat"), bytes("damaged"));
+            }
+        }
+
+        private static void createSymbolicLinkOrSkip(Path link, Path target)
+                throws IOException {
+            try {
+                Files.createSymbolicLink(link, target);
+            } catch (UnsupportedOperationException | SecurityException unavailable) {
+                Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+            } catch (IOException unavailable) {
+                Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+            }
+        }
+    }
 
     private static final class ThrowAfterMoveOperations
             implements BackupRestorer.MoveOperations {
