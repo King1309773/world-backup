@@ -442,6 +442,209 @@ public class BackupRestorerTest {
     }
 
     @Test
+    public void safetyMoveThatCompletesBeforeThrowIsTreatedAsMoved() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        Path restored = fixture.restorer(new ThrowAfterMoveOperations(MoveStage.SAFETY))
+            .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                chain.v3.getId());
+
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(restored.resolve("level.dat")));
+        assertArrayEquals(bytes("current"), Files.readAllBytes(fixture.gameDir
+            .resolve("restore-safety").resolve("World1-20261009-010203-004")
+            .resolve("current.dat")));
+        assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void promotionMoveThatCompletesBeforeThrowIsVerifiedAndAccepted() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        Path restored = fixture.restorer(new ThrowAfterMoveOperations(MoveStage.PROMOTION))
+            .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                chain.v3.getId());
+
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(restored.resolve("level.dat")));
+        assertArrayEquals(bytes("current"), Files.readAllBytes(fixture.gameDir
+            .resolve("restore-safety").resolve("World1-20261009-010203-004")
+            .resolve("current.dat")));
+        assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void promotedWorldIsStrictlyReverifiedBeforeItIsAccepted() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+        BackupRestorer.MoveOperations tamperingMove = new BackupRestorer.MoveOperations() {
+            @Override
+            public void move(Path source, Path target, CopyOption... options)
+                    throws IOException {
+                if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                    throw new AtomicMoveNotSupportedException(source.toString(),
+                        target.toString(), "exercise fallback");
+                }
+                Files.move(source, target, options);
+                if (source.toString().contains("worldbackup-tmp")) {
+                    Files.write(target.resolve("level.dat"), bytes("tampered"));
+                }
+            }
+        };
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(tamperingMove).restore(fixture.gameDir,
+                fixture.savesDir, "World1", fixture.repo, chain.v3.getId()));
+
+        assertEquals("worldbackup.error.restore_swap", error.getTranslationKey());
+        assertArrayEquals(bytes("current"), Files.readAllBytes(
+            fixture.savesDir.resolve("World1").resolve("current.dat")));
+        assertFalse(Files.exists(fixture.gameDir.resolve("restore-safety")
+            .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void ambiguousPromotionPreservesAndReportsExistingVerifiedRecovery()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+        BackupRestorer.MoveOperations ambiguousMove = new BackupRestorer.MoveOperations() {
+            @Override
+            public void move(Path source, Path target, CopyOption... options)
+                    throws IOException {
+                if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                    throw new AtomicMoveNotSupportedException(source.toString(),
+                        target.toString(), "exercise fallback");
+                }
+                if (source.toString().contains("worldbackup-tmp")) {
+                    Files.createDirectory(target);
+                    write(target.resolve("unknown.dat"), "unknown");
+                    throw new IOException("injected ambiguous promotion");
+                }
+                Files.move(source, target, options);
+            }
+        };
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(ambiguousMove).restore(fixture.gameDir,
+                fixture.savesDir, "World1", fixture.repo, chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertTrue(Files.isDirectory(recovery, LinkOption.NOFOLLOW_LINKS));
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+        assertTrue(Files.isDirectory(fixture.gameDir.resolve("restore-safety")
+            .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.isDirectory(fixture.savesDir.resolve("World1"),
+            LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void rollbackMoveThatCompletesBeforeThrowRestoresOriginalAndCleansTemp()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new ThrowAfterMoveOperations(MoveStage.ROLLBACK))
+                .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                    chain.v3.getId()));
+
+        assertEquals("worldbackup.error.restore_swap", error.getTranslationKey());
+        assertArrayEquals(bytes("current"), Files.readAllBytes(
+            fixture.savesDir.resolve("World1").resolve("current.dat")));
+        assertFalse(Files.exists(fixture.gameDir.resolve("restore-safety")
+            .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void strictRestoreVerificationAcceptsNormalRegularFileTree() throws Exception {
+        Path root = temp.newFolder("strict-normal").toPath();
+        write(root.resolve("a.dat"), "same");
+        write(root.resolve("nested/b.dat"), "other");
+        write(root.resolve("session.lock"), "ignored at the world root");
+
+        BackupRestorer.verifyRestoredTree(root,
+            manifest("a.dat", "same", "nested/b.dat", "other"));
+    }
+
+    @Test
+    public void strictRestoreVerificationRejectsInternalFileLinkEvenWithSameContents()
+            throws Exception {
+        Path root = temp.newFolder("strict-file-link").toPath();
+        Path target = write(root.resolve("b.dat"), "same");
+        try {
+            Files.createSymbolicLink(root.resolve("a.dat"), target.getFileName());
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> BackupRestorer.verifyRestoredTree(root,
+                manifest("a.dat", "same", "b.dat", "same")));
+
+        assertEquals("worldbackup.error.restore_verify", error.getTranslationKey());
+    }
+
+    @Test
+    public void strictRestoreVerificationRejectsExtraFileLink() throws Exception {
+        Path root = temp.newFolder("strict-extra-file-link").toPath();
+        write(root.resolve("level.dat"), "level");
+        Path outsideFile = write(temp.newFolder("link-target").toPath().resolve("extra.dat"),
+            "extra");
+        try {
+            Files.createSymbolicLink(root.resolve("extra.dat"), outsideFile);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> BackupRestorer.verifyRestoredTree(root,
+                manifest("level.dat", "level")));
+
+        assertEquals("worldbackup.error.restore_verify", error.getTranslationKey());
+    }
+
+    @Test
+    public void strictRestoreVerificationRejectsExtraDirectoryLink() throws Exception {
+        Path root = temp.newFolder("strict-extra-directory-link").toPath();
+        write(root.resolve("level.dat"), "level");
+        Path outsideDirectory = temp.newFolder("directory-target").toPath();
+        try {
+            Files.createSymbolicLink(root.resolve("linked-dir"), outsideDirectory);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> BackupRestorer.verifyRestoredTree(root,
+                manifest("level.dat", "level")));
+
+        assertEquals("worldbackup.error.restore_verify", error.getTranslationKey());
+    }
+
+    @Test
+    public void strictRestoreVerificationRejectsExtraDirectory() throws Exception {
+        Path root = temp.newFolder("strict-extra-directory").toPath();
+        write(root.resolve("level.dat"), "level");
+        Files.createDirectory(root.resolve("unexpected"));
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> BackupRestorer.verifyRestoredTree(root,
+                manifest("level.dat", "level")));
+
+        assertEquals("worldbackup.error.restore_verify", error.getTranslationKey());
+    }
+
+    @Test
     public void safetyNameCollisionDoesNotOverwriteExistingCopy() throws Exception {
         Fixture fixture = fixture();
         Chain chain = fixture.chain(true);
@@ -680,6 +883,36 @@ public class BackupRestorerTest {
                 throw new IOException("injected " + failure);
             }
             Files.move(source, target, options);
+        }
+    }
+
+    private enum MoveStage { SAFETY, PROMOTION, ROLLBACK }
+
+    private static final class ThrowAfterMoveOperations
+            implements BackupRestorer.MoveOperations {
+        private final MoveStage throwAfter;
+
+        private ThrowAfterMoveOperations(MoveStage throwAfter) {
+            this.throwAfter = throwAfter;
+        }
+
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(),
+                    "exercise fallback");
+            }
+            MoveStage stage = source.toString().contains("worldbackup-tmp")
+                ? MoveStage.PROMOTION
+                : source.toString().contains("restore-safety")
+                    ? MoveStage.ROLLBACK : MoveStage.SAFETY;
+            if (throwAfter == MoveStage.ROLLBACK && stage == MoveStage.PROMOTION) {
+                throw new IOException("injected promotion failure before move");
+            }
+            Files.move(source, target, options);
+            if (stage == throwAfter) {
+                throw new IOException("injected " + stage + " failure after move");
+            }
         }
     }
 }

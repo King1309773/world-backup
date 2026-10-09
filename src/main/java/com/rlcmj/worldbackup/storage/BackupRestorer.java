@@ -4,7 +4,6 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.rlcmj.worldbackup.core.BackupCancellation;
 import com.rlcmj.worldbackup.core.BackupCatalog;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupMode;
@@ -25,12 +24,16 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -47,6 +50,9 @@ public final class BackupRestorer {
     private static final String SESSION_LOCK = "session.lock";
     private static final DateTimeFormatter SAFETY_TIMESTAMP = DateTimeFormatter
         .ofPattern("yyyyMMdd-HHmmss-SSS", Locale.ROOT).withZone(ZoneOffset.UTC);
+    private static final int WINDOWS_REPARSE_POINT = 0x400;
+
+    private enum MoveState { COMPLETED, NOT_MOVED, AMBIGUOUS }
 
     interface MoveOperations {
         void move(Path source, Path target, CopyOption... options) throws IOException;
@@ -124,8 +130,9 @@ public final class BackupRestorer {
             temporary = createTemporaryDirectory(temporaryRoot, safeWorldId);
 
             reconstruct(repo, temporary, chain);
-            verify(temporary, chain.get(chain.size() - 1).getManifest());
-            Path restored = swap(game, world, temporary, safeWorldId);
+            SnapshotManifest targetManifest = chain.get(chain.size() - 1).getManifest();
+            verifyRestoredTree(temporary, targetManifest);
+            Path restored = swap(game, world, temporary, safeWorldId, targetManifest);
             temporary = null;
             return restored;
         } catch (BackupException failure) {
@@ -363,23 +370,30 @@ public final class BackupRestorer {
         }
     }
 
-    private static void verify(Path restored, SnapshotManifest expected)
+    static void verifyRestoredTree(Path restored, SnapshotManifest expected)
             throws BackupException {
-        SnapshotManifest actual;
+        Objects.requireNonNull(restored, "restored");
+        Objects.requireNonNull(expected, "expected");
+        Map<String, FileFingerprint> actual = new HashMap<>();
+        Set<String> actualDirectories = new HashSet<>();
         try {
-            actual = new SnapshotScanner().scan(restored, null, null,
-                new BackupCancellation());
-        } catch (java.io.InterruptedIOException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new BackupException("worldbackup.error.restore_verify", interrupted);
+            final Path root = requireDirectory(restored);
+            Files.walkFileTree(root, EnumSet.noneOf(java.nio.file.FileVisitOption.class),
+                Integer.MAX_VALUE,
+                strictVerificationVisitor(root, actual, actualDirectories));
+        } catch (BackupException failure) {
+            throw new BackupException("worldbackup.error.restore_verify", failure);
+        } catch (IOException | RuntimeException failure) {
+            throw new BackupException("worldbackup.error.restore_verify", failure);
         }
         Map<String, FileFingerprint> expectedFiles = new HashMap<>(expected.getFiles());
         expectedFiles.remove(SESSION_LOCK);
-        if (!expectedFiles.keySet().equals(actual.getFiles().keySet())) {
+        if (!expectedFiles.keySet().equals(actual.keySet())
+                || !expectedDirectories(expectedFiles.keySet()).equals(actualDirectories)) {
             throw new BackupException("worldbackup.error.restore_verify");
         }
         for (Map.Entry<String, FileFingerprint> entry : expectedFiles.entrySet()) {
-            FileFingerprint observed = actual.getFiles().get(entry.getKey());
+            FileFingerprint observed = actual.get(entry.getKey());
             FileFingerprint wanted = entry.getValue();
             if (observed == null || observed.getSize() != wanted.getSize()
                     || !observed.getSha256().equals(wanted.getSha256())) {
@@ -389,35 +403,220 @@ public final class BackupRestorer {
         }
     }
 
-    private Path swap(Path game, Path world, Path temporary, String worldId)
+    private static Set<String> expectedDirectories(Set<String> files) {
+        Set<String> directories = new HashSet<>();
+        for (String file : files) {
+            int separator = file.lastIndexOf('/');
+            while (separator >= 0) {
+                directories.add(file.substring(0, separator));
+                separator = file.lastIndexOf('/', separator - 1);
+            }
+        }
+        return directories;
+    }
+
+    private static java.nio.file.FileVisitor<Path> strictVerificationVisitor(
+            Path root, Map<String, FileFingerprint> actual,
+            Set<String> actualDirectories) {
+        return new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path directory,
+                                                     BasicFileAttributes attributes)
+                    throws IOException {
+                requireStrictNode(root, directory, attributes, true);
+                if (!directory.equals(root)) {
+                    actualDirectories.add(PortablePaths.normalizeRelativePath(
+                        root.relativize(directory).toString()));
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attributes)
+                    throws IOException {
+                String relative = PortablePaths.normalizeRelativePath(
+                    root.relativize(file).toString());
+                BasicFileAttributes stable = requireStrictNode(root, file, attributes, false);
+                if (SESSION_LOCK.equals(relative)) {
+                    return FileVisitResult.CONTINUE;
+                }
+                actual.put(relative, fingerprintStrict(file, stable));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException failure)
+                    throws IOException {
+                throw failure;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path directory, IOException failure)
+                    throws IOException {
+                if (failure != null) {
+                    throw failure;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        };
+    }
+
+    private static BasicFileAttributes requireStrictNode(Path root, Path node,
+                                                          BasicFileAttributes observed,
+                                                          boolean directory)
+            throws IOException {
+        BasicFileAttributes current = Files.readAttributes(node, BasicFileAttributes.class,
+            LinkOption.NOFOLLOW_LINKS);
+        Path absolute = node.toAbsolutePath().normalize();
+        boolean rightType = directory ? current.isDirectory() : current.isRegularFile();
+        if (!rightType || current.isSymbolicLink() || current.isOther()
+                || Files.isSymbolicLink(node) || isWindowsReparsePoint(node)
+                || !directory && !sameFileState(observed, current)
+                || !absolute.equals(absolute.toRealPath()) || !absolute.startsWith(root)) {
+            throw new IOException("Unsafe restored node: " + node);
+        }
+        return current;
+    }
+
+    private static boolean isWindowsReparsePoint(Path node) throws IOException {
+        try {
+            Object flags = Files.getAttribute(node, "dos:attributes",
+                LinkOption.NOFOLLOW_LINKS);
+            return flags instanceof Number
+                && (((Number) flags).intValue() & WINDOWS_REPARSE_POINT) != 0;
+        } catch (UnsupportedOperationException unsupported) {
+            return false;
+        }
+    }
+
+    private static FileFingerprint fingerprintStrict(Path file, BasicFileAttributes before)
+            throws IOException {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IOException("SHA-256 is unavailable", unavailable);
+        }
+        long size = 0L;
+        byte[] buffer = new byte[8192];
+        try (InputStream input = Files.newInputStream(file, StandardOpenOption.READ,
+                LinkOption.NOFOLLOW_LINKS)) {
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, count);
+                size += count;
+            }
+        }
+        BasicFileAttributes after = Files.readAttributes(file, BasicFileAttributes.class,
+            LinkOption.NOFOLLOW_LINKS);
+        if (!sameFileState(before, after) || size != before.size()) {
+            throw new IOException("Restored file changed during verification: " + file);
+        }
+        return new FileFingerprint(size, after.lastModifiedTime().toMillis(),
+            lowercaseHex(digest.digest()));
+    }
+
+    private static boolean sameFileState(BasicFileAttributes first,
+                                         BasicFileAttributes second) {
+        if (first.isRegularFile() != second.isRegularFile()
+                || first.isDirectory() != second.isDirectory()
+                || first.isSymbolicLink() != second.isSymbolicLink()
+                || first.isOther() != second.isOther() || first.size() != second.size()
+                || !first.lastModifiedTime().equals(second.lastModifiedTime())) {
+            return false;
+        }
+        Object firstKey = first.fileKey();
+        Object secondKey = second.fileKey();
+        return firstKey == null || secondKey == null || firstKey.equals(secondKey);
+    }
+
+    private static String lowercaseHex(byte[] value) {
+        StringBuilder result = new StringBuilder(value.length * 2);
+        for (byte item : value) {
+            result.append(String.format(Locale.ROOT, "%02x", item & 0xff));
+        }
+        return result.toString();
+    }
+
+    private Path swap(Path game, Path world, Path temporary, String worldId,
+                      SnapshotManifest targetManifest)
             throws BackupException {
         Path safety = null;
         boolean originalMoved = false;
-        try {
-            if (Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
-                Path safetyRoot = createSafeDirectory(game, "restore-safety");
+        if (Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
+            Path safetyRoot;
+            try {
+                safetyRoot = createSafeDirectory(game, "restore-safety");
                 safety = uniqueSafetyPath(safetyRoot, worldId);
                 moveSameVolume(world, safety);
-                originalMoved = true;
+            } catch (IOException safetyFailure) {
+                if (!Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
+                    throw recoveryFailure(safetyFailure, null, temporary, safety);
+                }
+                throw new BackupException("worldbackup.error.restore_swap", safetyFailure);
             }
+            originalMoved = true;
+        }
+        try {
             moveSameVolume(temporary, world);
+            verifyRestoredTree(world, targetManifest);
             return world;
-        } catch (IOException promotionFailure) {
+        } catch (IOException | BackupException promotionFailure) {
             if (!originalMoved) {
+                if (Files.exists(temporary, LinkOption.NOFOLLOW_LINKS)) {
+                    throw recoveryFailure(promotionFailure, null, temporary);
+                }
+                if (Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
+                    throw recoveryFailure(promotionFailure, null, world);
+                }
                 throw new BackupException("worldbackup.error.restore_swap", promotionFailure);
             }
+            boolean verifiedTemporaryAvailable = Files.exists(temporary,
+                LinkOption.NOFOLLOW_LINKS);
             try {
+                if (Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
+                    if (Files.exists(temporary, LinkOption.NOFOLLOW_LINKS)) {
+                        throw new IOException("Cannot preserve promoted world because both "
+                            + world + " and " + temporary + " exist");
+                    }
+                    moveSameVolume(world, temporary);
+                }
                 moveSameVolume(safety, world);
             } catch (IOException rollbackFailure) {
-                IOException recovery = new IOException("Restore rollback failed; verified "
-                    + "recovery remains at " + temporary.toAbsolutePath().normalize(),
-                    promotionFailure);
-                recovery.addSuppressed(rollbackFailure);
-                throw new BackupException("worldbackup.error.restore_rollback", recovery,
-                    temporary.toAbsolutePath().normalize().toString());
+                if (verifiedTemporaryAvailable) {
+                    throw recoveryFailure(promotionFailure, rollbackFailure,
+                        temporary, safety, world);
+                }
+                throw recoveryFailure(promotionFailure, rollbackFailure,
+                    safety, world, temporary);
             }
             throw new BackupException("worldbackup.error.restore_swap", promotionFailure);
         }
+    }
+
+    private static BackupException recoveryFailure(Throwable primary, Throwable secondary,
+                                                    Path... candidates) {
+        Path recoveryPath = firstExisting(candidates);
+        String detail = recoveryPath == null
+            ? "Restore rollback failed; no recovery path could be confirmed"
+            : "Restore rollback failed; recovery remains at " + recoveryPath;
+        IOException recovery = new IOException(detail, primary);
+        if (secondary != null) {
+            recovery.addSuppressed(secondary);
+        }
+        return recoveryPath == null
+            ? new BackupException("worldbackup.error.restore_rollback", recovery)
+            : new BackupException("worldbackup.error.restore_rollback", recovery,
+                recoveryPath.toString());
+    }
+
+    private static Path firstExisting(Path... candidates) {
+        for (Path candidate : candidates) {
+            if (candidate != null && Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)) {
+                return candidate.toAbsolutePath().normalize();
+            }
+        }
+        return null;
     }
 
     private Path uniqueSafetyPath(Path safetyRoot, String worldId) throws BackupException {
@@ -464,10 +663,56 @@ public final class BackupRestorer {
         validateMovePaths(source, target);
         try {
             moves.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException unsupported) {
-            validateMovePaths(source, target);
-            moves.move(source, target);
+            requireCompletedMove(source, target, null);
+            return;
+        } catch (IOException atomicFailure) {
+            MoveState state = observeMove(source, target);
+            if (state == MoveState.COMPLETED) {
+                return;
+            }
+            if (!(atomicFailure instanceof AtomicMoveNotSupportedException)
+                    || state == MoveState.AMBIGUOUS) {
+                throw moveFailure(source, target, state, atomicFailure);
+            }
         }
+
+        validateMovePaths(source, target);
+        try {
+            moves.move(source, target);
+            requireCompletedMove(source, target, null);
+        } catch (IOException fallbackFailure) {
+            MoveState state = observeMove(source, target);
+            if (state == MoveState.COMPLETED) {
+                return;
+            }
+            throw moveFailure(source, target, state, fallbackFailure);
+        }
+    }
+
+    private static void requireCompletedMove(Path source, Path target, IOException cause)
+            throws IOException {
+        MoveState state = observeMove(source, target);
+        if (state != MoveState.COMPLETED) {
+            throw moveFailure(source, target, state, cause);
+        }
+    }
+
+    private static MoveState observeMove(Path source, Path target) {
+        boolean sourceExists = Files.exists(source, LinkOption.NOFOLLOW_LINKS);
+        boolean targetExists = Files.exists(target, LinkOption.NOFOLLOW_LINKS);
+        if (!sourceExists && targetExists) {
+            return MoveState.COMPLETED;
+        }
+        if (sourceExists && !targetExists) {
+            return MoveState.NOT_MOVED;
+        }
+        return MoveState.AMBIGUOUS;
+    }
+
+    private static IOException moveFailure(Path source, Path target, MoveState state,
+                                           IOException cause) {
+        return new IOException("Move ended in " + state + " state (source=" + source
+            + ", target=" + target + ")", cause);
     }
 
     private static void validateMovePaths(Path source, Path target) throws IOException {
