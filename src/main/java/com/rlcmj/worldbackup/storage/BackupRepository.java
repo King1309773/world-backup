@@ -17,6 +17,7 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -443,10 +444,22 @@ public final class BackupRepository {
             if (absolute.startsWith(world) || world.startsWith(absolute)) {
                 throw new BackupException("worldbackup.error.path_escape", repoRoot);
             }
-            Files.createDirectories(absolute);
-            Path real = absolute.toRealPath();
-            if (!Files.isDirectory(real, LinkOption.NOFOLLOW_LINKS)
-                    || !absolute.equals(real)
+            Path current = absolute.getRoot();
+            if (current == null) {
+                throw new BackupException("worldbackup.error.path_escape", repoRoot);
+            }
+            verifyRepositoryDirectory(current, repoRoot);
+            for (Path component : absolute) {
+                current = current.resolve(component);
+                if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                    verifyRepositoryDirectory(current, repoRoot);
+                } else {
+                    Files.createDirectory(current);
+                    verifyRepositoryDirectory(current, repoRoot);
+                }
+            }
+            Path real = current.toRealPath();
+            if (!absolute.equals(real)
                     || real.startsWith(world) || world.startsWith(real)) {
                 throw new BackupException("worldbackup.error.path_escape", repoRoot);
             }
@@ -455,6 +468,18 @@ public final class BackupRepository {
             throw failure;
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.archive_write", failure);
+        }
+    }
+
+    private static void verifyRepositoryDirectory(Path directory, Path requestedRoot)
+            throws IOException, BackupException {
+        Path lexical = directory.toAbsolutePath().normalize();
+        BasicFileAttributes attributes = Files.readAttributes(lexical,
+            BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isDirectory() || attributes.isSymbolicLink()
+                || Files.isSymbolicLink(lexical)
+                || !lexical.equals(lexical.toRealPath())) {
+            throw new BackupException("worldbackup.error.path_escape", requestedRoot);
         }
     }
 

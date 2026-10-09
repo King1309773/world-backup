@@ -9,9 +9,12 @@ import com.rlcmj.worldbackup.core.BackupVersion;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.Assume;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.CopyOption;
@@ -381,6 +384,65 @@ public class BackupRepositoryTest {
     }
 
     @Test
+    public void rejectsSymlinkAncestorBeforeCreatingDirectoryInItsTarget() throws Exception {
+        Path link = temp.getRoot().toPath().resolve("repository-link");
+        createSymbolicLinkOrSkip(link, world);
+        Path escapedDirectory = world.resolve("must-not-be-created");
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> repository(Long.MAX_VALUE).createBackup(world,
+                link.resolve("must-not-be-created"), "World1", "My World",
+                BackupMode.FULL, BackupTrigger.MANUAL, 10, 5, NOW));
+
+        assertEquals("worldbackup.error.path_escape", failure.getTranslationKey());
+        assertFalse(Files.exists(escapedDirectory));
+    }
+
+    @Test
+    public void rejectsWindowsJunctionAncestorBeforeCreatingDirectoryInItsTarget()
+            throws Exception {
+        Assume.assumeTrue("Windows junctions only", File.separatorChar == '\\');
+        Path target = temp.newFolder("junction-repository-target").toPath();
+        Path junction = temp.getRoot().toPath().resolve("repository-junction");
+        createJunctionOrSkip(junction, target);
+        Path escapedDirectory = target.resolve("must-not-be-created");
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> repository(Long.MAX_VALUE).createBackup(world,
+                junction.resolve("must-not-be-created"), "World1", "My World",
+                BackupMode.FULL, BackupTrigger.MANUAL, 10, 5, NOW));
+
+        assertEquals("worldbackup.error.path_escape", failure.getTranslationKey());
+        assertFalse(Files.exists(escapedDirectory));
+    }
+
+    @Test
+    public void createsAndValidatesEachMissingRepositoryDirectory() throws Exception {
+        Path nestedRepository = temp.getRoot().toPath()
+            .resolve("nested").resolve("missing").resolve("repository");
+
+        repository(Long.MAX_VALUE).createBackup(world, nestedRepository,
+            "World1", "My World", BackupMode.FULL, BackupTrigger.MANUAL, 10, 5, NOW);
+
+        assertTrue(Files.isDirectory(nestedRepository));
+        assertTrue(Files.isRegularFile(nestedRepository.resolve("index.json")));
+    }
+
+    @Test
+    public void rejectsDirectRepositorySymlink() throws Exception {
+        Path target = temp.newFolder("direct-repository-target").toPath();
+        Path link = temp.getRoot().toPath().resolve("direct-repository-link");
+        createSymbolicLinkOrSkip(link, target);
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> repository(Long.MAX_VALUE).createBackup(world, link,
+                "World1", "My World", BackupMode.FULL, BackupTrigger.MANUAL, 10, 5, NOW));
+
+        assertEquals("worldbackup.error.path_escape", failure.getTranslationKey());
+        assertEquals(Collections.emptyList(), directoryEntries(target));
+    }
+
+    @Test
     public void acceptsRenamedDisplayNameForTheSameWorldId() throws Exception {
         BackupRepository repository = repository(Long.MAX_VALUE);
         repository.createBackup(world, repo, "World1", "Old Name", BackupMode.FULL,
@@ -631,6 +693,36 @@ public class BackupRepositoryTest {
             return files.anyMatch(path -> path.getFileName().toString()
                 .endsWith(".building"));
         }
+    }
+
+    private static List<String> directoryEntries(Path directory) throws IOException {
+        List<String> entries = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(directory)) {
+            paths.map(path -> path.getFileName().toString()).forEach(entries::add);
+        }
+        Collections.sort(entries);
+        return entries;
+    }
+
+    private static void createSymbolicLinkOrSkip(Path link, Path target) {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+    }
+
+    private static void createJunctionOrSkip(Path junction, Path target) throws Exception {
+        Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J",
+            junction.toString(), target.toString()).redirectErrorStream(true).start();
+        try (InputStream output = process.getInputStream()) {
+            byte[] buffer = new byte[256];
+            while (output.read(buffer) >= 0) {
+                // Drain command output so the process cannot block.
+            }
+        }
+        int exitCode = process.waitFor();
+        Assume.assumeTrue("Directory junctions are unavailable", exitCode == 0);
     }
 
     private static BackupVersion latestVersion(BackupCatalog catalog) {
