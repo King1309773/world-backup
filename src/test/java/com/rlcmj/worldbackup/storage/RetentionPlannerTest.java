@@ -72,6 +72,34 @@ public class RetentionPlannerTest {
             new HashSet<>(plan.getArchiveNamesToDelete()));
     }
 
+    @Test
+    public void malformedFullDoesNotRetainItsUnrelatedParent() {
+        BackupCatalog catalog = BackupCatalog.empty("World1", "My World");
+        catalog.add(full("unrelated", 1L, BackupMode.FULL));
+        catalog.add(independentWithParent("malformed-full", 2L, BackupMode.FULL,
+            "unrelated"));
+
+        RetentionPlanner.Plan plan = new RetentionPlanner().plan(catalog, 1);
+
+        assertEquals(Collections.singleton("malformed-full"), ids(plan));
+        assertEquals(Collections.singletonList("unrelated-full.zip"),
+            plan.getArchiveNamesToDelete());
+    }
+
+    @Test
+    public void malformedOverwriteDoesNotRetainItsUnrelatedParent() {
+        BackupCatalog catalog = BackupCatalog.empty("World1", "My World");
+        catalog.add(full("unrelated", 1L, BackupMode.FULL));
+        catalog.add(independentWithParent("malformed-overwrite", 2L,
+            BackupMode.OVERWRITE, "unrelated"));
+
+        RetentionPlanner.Plan plan = new RetentionPlanner().plan(catalog, 1);
+
+        assertEquals(Collections.singleton("malformed-overwrite"), ids(plan));
+        assertEquals(Collections.singletonList("unrelated-full.zip"),
+            plan.getArchiveNamesToDelete());
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void rejectsNonPositiveVisibleLimit() {
         new RetentionPlanner().plan(BackupCatalog.empty("World1", "My World"), 0);
@@ -89,6 +117,14 @@ public class RetentionPlannerTest {
         return new BackupVersion(id, time, BackupTrigger.MANUAL, BackupMode.INCREMENTAL,
             id + "-delta.zip", parent, base, visible, 1L, 1L, 1L,
             new SnapshotManifest(), Collections.emptyList(), Collections.emptyList());
+    }
+
+    private static BackupVersion independentWithParent(String id, long time,
+                                                       BackupMode mode, String parent) {
+        String suffix = mode == BackupMode.OVERWRITE ? "-latest.zip" : "-full.zip";
+        return new BackupVersion(id, time, BackupTrigger.MANUAL, mode, id + suffix,
+            parent, null, true, 1L, 1L, 1L, new SnapshotManifest(),
+            Collections.emptyList(), Collections.emptyList());
     }
 
     private static Set<String> ids(RetentionPlanner.Plan plan) {

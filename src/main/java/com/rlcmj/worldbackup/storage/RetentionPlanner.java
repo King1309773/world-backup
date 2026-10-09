@@ -91,6 +91,9 @@ public final class RetentionPlanner {
                 return;
             }
             reachable.add(currentId);
+            if (current.getMode() != BackupMode.INCREMENTAL) {
+                return;
+            }
             currentId = current.getParentId();
         }
     }

@@ -238,6 +238,64 @@ public class BackupRepositoryTest {
     }
 
     @Test
+    public void overwriteArchiveFailurePreservesPreviousOverwriteTransaction() throws Exception {
+        BackupRepository good = repository(Long.MAX_VALUE);
+        good.createBackup(world, repo, "World1", "My World", BackupMode.OVERWRITE,
+            BackupTrigger.MANUAL, 10, 5, NOW);
+        byte[] originalIndex = Files.readAllBytes(repo.resolve("index.json"));
+        List<String> originalFiles = repositoryFiles();
+        BackupVersion previous = new CatalogStore().load(repo).getVersions().get(0);
+        write("level.dat", "changed overwrite");
+        ArchiveStore failingArchive = new ArchiveStore(new ArchiveStore.PublishOperations() {
+            @Override public void move(Path source, Path target, CopyOption... options)
+                    throws IOException {
+                throw new IOException("simulated overwrite publish failure");
+            }
+            @Override public OutputStream newOutputStream(Path path, OpenOption... options)
+                    throws IOException {
+                return Files.newOutputStream(path, options);
+            }
+            @Override public void beforeFallbackMove(Path source) { }
+        });
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> repository(Long.MAX_VALUE, failingArchive, new CatalogStore()).createBackup(
+                world, repo, "World1", "My World", BackupMode.OVERWRITE,
+                BackupTrigger.EXIT, 10, 5, NOW));
+
+        assertEquals("worldbackup.error.archive_write", failure.getTranslationKey());
+        assertTrue(Arrays.equals(originalIndex, Files.readAllBytes(repo.resolve("index.json"))));
+        assertEquals(originalFiles, repositoryFiles());
+        assertTrue(Files.exists(repo.resolve(previous.getArchiveName())));
+        assertFalse(hasBuildingFile());
+    }
+
+    @Test
+    public void overwriteCatalogFailurePreservesPreviousOverwriteTransaction() throws Exception {
+        BackupRepository good = repository(Long.MAX_VALUE);
+        good.createBackup(world, repo, "World1", "My World", BackupMode.OVERWRITE,
+            BackupTrigger.MANUAL, 10, 5, NOW);
+        byte[] originalIndex = Files.readAllBytes(repo.resolve("index.json"));
+        List<String> originalFiles = repositoryFiles();
+        BackupVersion previous = new CatalogStore().load(repo).getVersions().get(0);
+        write("level.dat", "changed overwrite");
+        CatalogStore failingStore = new CatalogStore((target, writer) -> {
+            throw new IOException("simulated overwrite catalog failure");
+        });
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> repository(Long.MAX_VALUE, new ArchiveStore(), failingStore).createBackup(
+                world, repo, "World1", "My World", BackupMode.OVERWRITE,
+                BackupTrigger.EXIT, 10, 5, NOW));
+
+        assertEquals("worldbackup.error.catalog_write", failure.getTranslationKey());
+        assertTrue(Arrays.equals(originalIndex, Files.readAllBytes(repo.resolve("index.json"))));
+        assertEquals(originalFiles, repositoryFiles());
+        assertTrue(Files.exists(repo.resolve(previous.getArchiveName())));
+        assertFalse(hasBuildingFile());
+    }
+
+    @Test
     public void unreadableLatestArchiveStartsFreshBase() throws Exception {
         BackupRepository repository = repository(Long.MAX_VALUE);
         repository.createBackup(world, repo, "World1", "My World", BackupMode.INCREMENTAL,
