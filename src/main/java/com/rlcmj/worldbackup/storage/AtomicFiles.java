@@ -5,6 +5,7 @@ import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -66,8 +67,8 @@ public final class AtomicFiles {
         Path temp = target.resolveSibling(target.getFileName().toString() + ".tmp");
 
         try {
-            try (OutputStream output = Files.newOutputStream(temp, StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            try (OutputStream output = Files.newOutputStream(temp, StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
                 writer.accept(output);
                 output.flush();
             }

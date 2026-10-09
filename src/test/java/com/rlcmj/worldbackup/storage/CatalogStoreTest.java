@@ -8,6 +8,7 @@ import com.rlcmj.worldbackup.core.BackupTrigger;
 import com.rlcmj.worldbackup.core.BackupVersion;
 import com.rlcmj.worldbackup.core.FileFingerprint;
 import com.rlcmj.worldbackup.core.SnapshotManifest;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -311,6 +313,52 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void catalogSaveDoesNotFollowPreexistingTempSymlink() throws Exception {
+        Path directory = temp.newFolder("catalog-temp-symlink").toPath();
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path canary = directory.resolve("outside-canary");
+        Path temporary = repo.resolve("index.json.tmp");
+        Files.write(canary, "untouched".getBytes(StandardCharsets.UTF_8));
+        try {
+            Files.createSymbolicLink(temporary, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> new CatalogStore().save(repo, BackupCatalog.empty("World1", "World")));
+
+        assertEquals("worldbackup.error.catalog_write", failure.getTranslationKey());
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertFalse(Files.exists(temporary, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(repo.resolve("index.json"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void catalogSaveDoesNotTruncatePreexistingTempHardlink() throws Exception {
+        Path directory = temp.newFolder("catalog-temp-hardlink").toPath();
+        Path repo = Files.createDirectories(directory.resolve("repo"));
+        Path canary = directory.resolve("outside-canary");
+        Path temporary = repo.resolve("index.json.tmp");
+        Files.write(canary, "untouched".getBytes(StandardCharsets.UTF_8));
+        try {
+            Files.createLink(temporary, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Hard links are unavailable", unavailable);
+        }
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> new CatalogStore().save(repo, BackupCatalog.empty("World1", "World")));
+
+        assertEquals("worldbackup.error.catalog_write", failure.getTranslationKey());
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertFalse(Files.exists(temporary, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(repo.resolve("index.json"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
     public void failedNonAtomicFallbackRestoresOldTargetAndCleansArtifacts() throws Exception {
         Path directory = temp.newFolder("fallback-rollback").toPath();
         Path target = directory.resolve("index.json");
@@ -444,6 +492,58 @@ public class CatalogStoreTest {
         assertTrue(Arrays.equals(targetBeforeRetry, Files.readAllBytes(target)));
         assertTrue(Arrays.equals(backupBeforeRetry, Files.readAllBytes(backup)));
         assertFalse(Files.exists(temporary));
+    }
+
+    @Test
+    public void existingRecoveryBackupSymlinkIsNotFollowedOrOverwritten() throws Exception {
+        Path directory = temp.newFolder("existing-recovery-backup-symlink").toPath();
+        Path target = directory.resolve("index.json");
+        Path backup = directory.resolve("index.json.bak");
+        Path canary = directory.resolve("outside-canary");
+        Files.write(target, "old".getBytes(StandardCharsets.UTF_8));
+        Files.write(canary, "untouched".getBytes(StandardCharsets.UTF_8));
+        try {
+            Files.createSymbolicLink(backup, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+        }
+
+        assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)),
+            atomicMoveUnsupported()));
+
+        assertEquals("old", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertTrue(Files.isSymbolicLink(backup));
+        assertFalse(Files.exists(directory.resolve("index.json.tmp"),
+            LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void existingRecoveryBackupHardlinkIsNotTruncatedOrOverwritten() throws Exception {
+        Path directory = temp.newFolder("existing-recovery-backup-hardlink").toPath();
+        Path target = directory.resolve("index.json");
+        Path backup = directory.resolve("index.json.bak");
+        Path canary = directory.resolve("outside-canary");
+        Files.write(target, "old".getBytes(StandardCharsets.UTF_8));
+        Files.write(canary, "untouched".getBytes(StandardCharsets.UTF_8));
+        try {
+            Files.createLink(backup, canary);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            Assume.assumeNoException("Hard links are unavailable", unavailable);
+        }
+
+        assertThrows(IOException.class, () -> AtomicFiles.write(target,
+            output -> output.write("new".getBytes(StandardCharsets.UTF_8)),
+            atomicMoveUnsupported()));
+
+        assertEquals("old", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        assertEquals("untouched", new String(Files.readAllBytes(canary),
+            StandardCharsets.UTF_8));
+        assertTrue(Files.isSameFile(backup, canary));
+        assertFalse(Files.exists(directory.resolve("index.json.tmp"),
+            LinkOption.NOFOLLOW_LINKS));
     }
 
     @Test
