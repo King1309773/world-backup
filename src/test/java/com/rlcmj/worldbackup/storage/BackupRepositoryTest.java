@@ -41,6 +41,7 @@ import static org.junit.Assert.assertTrue;
 public class BackupRepositoryTest {
     private static final long NOW = 1_700_000_000_123L;
     private static final long RESERVE = 64L * 1024L * 1024L;
+    private static final long LAST_MANAGED_MILLISECOND = 253_402_300_799_999L;
 
     @Rule public TemporaryFolder temp = new TemporaryFolder();
 
@@ -182,6 +183,34 @@ public class BackupRepositoryTest {
         assertEquals("worldbackup.error.disk_space", failure.getTranslationKey());
         assertTrue(Arrays.equals(originalIndex, Files.readAllBytes(repo.resolve("index.json"))));
         assertEquals(originalFiles, repositoryFiles());
+    }
+
+    @Test
+    public void removesOnlyUnreferencedManagedArchivesBeforeSpacePreflight() throws Exception {
+        BackupRepository initial = repository(Long.MAX_VALUE);
+        initial.createBackup(world, repo, "World1", "My World", BackupMode.FULL,
+            BackupTrigger.MANUAL, 10, 5, NOW);
+        BackupVersion referenced = new CatalogStore().load(repo).getVersions().get(0);
+        Path referencedArchive = repo.resolve(referenced.getArchiveName());
+        Path orphan = repo.resolve("20231114-221320-123-deadbeef-full.zip");
+        Path unmanaged = repo.resolve("keep-me.zip");
+        Files.write(orphan, new byte[] { 1 });
+        Files.write(unmanaged, new byte[] { 2 });
+
+        BackupRepository recovering = new BackupRepository(new ArchiveStore(),
+            new CatalogStore(), new SnapshotScanner(), new RetentionPlanner(), path -> {
+                assertFalse(Files.exists(orphan));
+                assertTrue(Files.exists(referencedArchive));
+                assertTrue(Files.exists(unmanaged));
+                return Long.MAX_VALUE;
+            }, () -> NOW, () -> String.format("%08x", ids.incrementAndGet()));
+
+        recovering.createBackup(world, repo, "World1", "My World", BackupMode.FULL,
+            BackupTrigger.EXIT, 10, 5, NOW);
+
+        assertFalse(Files.exists(orphan));
+        assertTrue(Files.exists(referencedArchive));
+        assertTrue(Files.exists(unmanaged));
     }
 
     @Test
@@ -377,14 +406,35 @@ public class BackupRepositoryTest {
     }
 
     @Test
+    public void rejectsTimestampsThatCannotUseManagedArchiveNames() throws Exception {
+        BackupRepository lastValid = new BackupRepository(new ArchiveStore(),
+            new CatalogStore(), new SnapshotScanner(), new RetentionPlanner(),
+            path -> Long.MAX_VALUE, () -> LAST_MANAGED_MILLISECOND,
+            () -> String.format("%08x", ids.incrementAndGet()));
+
+        lastValid.createBackup(world, repo, "World1", "My World", BackupMode.FULL,
+            BackupTrigger.MANUAL, 10, 5, LAST_MANAGED_MILLISECOND);
+
+        BackupVersion version = new CatalogStore().load(repo).getVersions().get(0);
+        assertTrue(version.getId().matches("99991231-235959-999-[0-9a-f]{8}"));
+        List<String> before = repositoryFiles();
+        assertThrows(IllegalArgumentException.class, () -> lastValid.createBackup(world, repo,
+            "World1", "My World", BackupMode.FULL, BackupTrigger.EXIT, 10, 5,
+            LAST_MANAGED_MILLISECOND));
+        assertThrows(IllegalArgumentException.class, () -> repository(Long.MAX_VALUE)
+            .createBackup(world, repo, "World1", "My World", BackupMode.FULL,
+                BackupTrigger.EXIT, 10, 5, LAST_MANAGED_MILLISECOND + 1L));
+        assertEquals(before, repositoryFiles());
+    }
+
+    @Test
     public void retriesRandomSuffixCollisionWithinTheSameMillisecond() throws Exception {
         AtomicInteger attempts = new AtomicInteger();
         BackupRepository repository = new BackupRepository(new ArchiveStore(),
             new CatalogStore(), new SnapshotScanner(), new RetentionPlanner(),
             path -> Long.MAX_VALUE, () -> NOW,
             () -> attempts.getAndIncrement() == 0 ? "00000001" : "00000002");
-        Files.write(repo.resolve("20231114-221320-123-00000001-full.zip"),
-            new byte[] { 1 });
+        Files.createDirectory(repo.resolve("20231114-221320-123-00000001-full.zip"));
 
         repository.createBackup(world, repo, "World1", "My World", BackupMode.FULL,
             BackupTrigger.MANUAL, 10, 5, NOW);

@@ -35,6 +35,7 @@ import java.util.stream.Stream;
 
 public final class BackupRepository {
     private static final long SPACE_RESERVE_BYTES = 64L * 1024L * 1024L;
+    private static final long MAX_MANAGED_TIMESTAMP_MILLIS = 253_402_300_799_999L;
     private static final Object BACKUP_LOCK = new Object();
     private static final DateTimeFormatter UTC_TIMESTAMP = DateTimeFormatter
         .ofPattern("yyyyMMdd-HHmmss-SSS", Locale.ROOT).withZone(ZoneOffset.UTC);
@@ -117,6 +118,7 @@ public final class BackupRepository {
         Path repository = requireRepositoryRoot(repoRoot, world);
         BackupCatalog current = loadOrCreate(repository, worldId, displayName);
         validateIdentity(current, worldId);
+        cleanupUnreferencedArchives(repository, current, Collections.emptyList());
 
         ParentState parent = mode == BackupMode.INCREMENTAL
             ? findParent(repository, current, incrementsPerBase) : ParentState.none();
@@ -311,12 +313,16 @@ public final class BackupRepository {
     }
 
     private static long nextCreatedAt(BackupCatalog catalog, long observedTime) {
+        requireManagedTimestamp(observedTime, "createdAt");
         BackupVersion latest = latest(catalog.getVersions());
         if (latest == null || observedTime > latest.getCreatedAt()) {
             return observedTime;
         }
-        return latest.getCreatedAt() == Long.MAX_VALUE
-            ? Long.MAX_VALUE : latest.getCreatedAt() + 1L;
+        if (latest.getCreatedAt() >= MAX_MANAGED_TIMESTAMP_MILLIS) {
+            throw new IllegalArgumentException(
+                "createdAt cannot advance within managed archive name range");
+        }
+        return latest.getCreatedAt() + 1L;
     }
 
     private static BackupVersion latest(List<BackupVersion> versions) {
@@ -389,7 +395,7 @@ public final class BackupRepository {
             }
             Path archive = resolveArchive(repository, archiveName);
             if (Files.isRegularFile(archive, LinkOption.NOFOLLOW_LINKS)
-                    || Files.isSymbolicLink(archive)) {
+                    && !Files.isSymbolicLink(archive)) {
                 Files.deleteIfExists(archive);
             }
         } catch (BackupException | IOException | RuntimeException ignored) {
@@ -479,6 +485,14 @@ public final class BackupRepository {
         }
         if (startedAtMillis < 0L) {
             throw new IllegalArgumentException("startedAtMillis must not be negative");
+        }
+        requireManagedTimestamp(startedAtMillis, "startedAtMillis");
+    }
+
+    private static void requireManagedTimestamp(long value, String name) {
+        if (value < 0L || value > MAX_MANAGED_TIMESTAMP_MILLIS) {
+            throw new IllegalArgumentException(name
+                + " must be within the managed archive timestamp range");
         }
     }
 
