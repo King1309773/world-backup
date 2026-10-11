@@ -58,17 +58,14 @@ public final class BackupRestorer {
     private static final class DirectoryIdentity {
         private final Object fileKey;
         private final FileTime creationTime;
-        private final FileTime modifiedTime;
         private final Map<String, FileFingerprint> files;
         private final Set<String> directories;
 
         private DirectoryIdentity(Object fileKey, FileTime creationTime,
-                                  FileTime modifiedTime,
                                   Map<String, FileFingerprint> files,
                                   Set<String> directories) {
             this.fileKey = fileKey;
             this.creationTime = creationTime;
-            this.modifiedTime = modifiedTime;
             this.files = files;
             this.directories = directories;
         }
@@ -588,26 +585,39 @@ public final class BackupRestorer {
         DirectoryIdentity originalIdentity = null;
         boolean originalMoved = false;
         if (Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
+            boolean safetyMoveCompleted = false;
             try {
                 safetyRoot = createSafeDirectory(game, "restore-safety");
                 safety = uniqueSafetyPath(safetyRoot, worldId);
                 originalIdentity = captureDirectoryIdentity(world);
                 moveSameVolume(world, safety);
-            } catch (IOException safetyFailure) {
-                if (!Files.exists(world, LinkOption.NOFOLLOW_LINKS)) {
-                    throw recoveryFailure(safetyFailure, null, targetManifest,
-                        RecoveryCandidate.restored(temporary),
-                        RecoveryCandidate.original(safety, safetyRoot, originalIdentity));
+                safetyMoveCompleted = true;
+                if (!isVerifiedOriginal(safety, safetyRoot, originalIdentity)) {
+                    throw new IOException("Moved safety copy failed original-world "
+                        + "identity verification: " + safety);
                 }
-                throw new BackupException("worldbackup.error.restore_swap", safetyFailure);
+            } catch (IOException | RuntimeException safetyFailure) {
+                if (!safetyMoveCompleted
+                        && isVerifiedOriginal(world, world.getParent(), originalIdentity)) {
+                    throw new BackupException("worldbackup.error.restore_swap", safetyFailure);
+                }
+                throw recoveryFailure(safetyFailure, null, targetManifest,
+                    RecoveryCandidate.restored(temporary),
+                    RecoveryCandidate.original(safety, safetyRoot, originalIdentity),
+                    RecoveryCandidate.original(world, world.getParent(), originalIdentity));
             }
             originalMoved = true;
         }
         try {
             moveSameVolume(temporary, world);
             verifyRestoredTree(world, targetManifest);
+            if (originalMoved
+                    && !isVerifiedOriginal(safety, safetyRoot, originalIdentity)) {
+                throw new IOException("Safety copy changed before restore completion: "
+                    + safety);
+            }
             return world;
-        } catch (IOException | BackupException promotionFailure) {
+        } catch (IOException | BackupException | RuntimeException promotionFailure) {
             if (!originalMoved) {
                 if (observeMove(temporary, world) == MoveState.NOT_MOVED) {
                     throw new BackupException("worldbackup.error.restore_swap",
@@ -626,10 +636,15 @@ public final class BackupRestorer {
                     moveSameVolume(world, temporary);
                 }
                 moveSameVolume(safety, world);
-            } catch (IOException rollbackFailure) {
+                if (!isVerifiedOriginal(world, world.getParent(), originalIdentity)) {
+                    throw new IOException("Rolled-back world failed original-world "
+                        + "identity verification: " + world);
+                }
+            } catch (IOException | RuntimeException rollbackFailure) {
                 throw recoveryFailure(promotionFailure, rollbackFailure, targetManifest,
                     RecoveryCandidate.restored(temporary),
                     RecoveryCandidate.original(safety, safetyRoot, originalIdentity),
+                    RecoveryCandidate.original(world, world.getParent(), originalIdentity),
                     RecoveryCandidate.restored(world));
             }
             throw new BackupException("worldbackup.error.restore_swap", promotionFailure);
@@ -656,24 +671,25 @@ public final class BackupRestorer {
     private static Path firstVerifiedRecovery(SnapshotManifest targetManifest,
                                               RecoveryCandidate... candidates) {
         for (RecoveryCandidate candidate : candidates) {
-            if (candidate == null || candidate.path == null
-                    || !Files.exists(candidate.path, LinkOption.NOFOLLOW_LINKS)) {
-                continue;
-            }
-            Path absolute = candidate.path.toAbsolutePath().normalize();
-            if (!hasTrustedParent(absolute, candidate.expectedParent)) {
-                continue;
-            }
-            if (candidate.originalIdentity == null) {
-                try {
-                    verifyRestoredTree(absolute, targetManifest);
-                    return absolute;
-                } catch (BackupException invalidRecovery) {
+            try {
+                if (candidate == null || candidate.path == null
+                        || !Files.exists(candidate.path, LinkOption.NOFOLLOW_LINKS)) {
                     continue;
                 }
-            }
-            if (matchesDirectoryIdentity(absolute, candidate.originalIdentity)) {
-                return absolute;
+                Path absolute = candidate.path.toAbsolutePath().normalize();
+                if (!hasTrustedParent(absolute, candidate.expectedParent)) {
+                    continue;
+                }
+                if (candidate.originalIdentity == null) {
+                    verifyRestoredTree(absolute, targetManifest);
+                    return absolute;
+                }
+                if (isVerifiedOriginal(absolute, candidate.expectedParent,
+                        candidate.originalIdentity)) {
+                    return absolute;
+                }
+            } catch (BackupException | RuntimeException invalidRecovery) {
+                // Untrusted recovery candidates fail closed; inspect the next candidate.
             }
         }
         return null;
@@ -691,6 +707,18 @@ public final class BackupRestorer {
         }
     }
 
+    private static boolean isVerifiedOriginal(Path candidate, Path expectedParent,
+                                              DirectoryIdentity identity) {
+        try {
+            return candidate != null && identity != null
+                && Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)
+                && hasTrustedParent(candidate.toAbsolutePath().normalize(), expectedParent)
+                && matchesDirectoryIdentity(candidate, identity);
+        } catch (RuntimeException invalidDirectory) {
+            return false;
+        }
+    }
+
     private static DirectoryIdentity captureDirectoryIdentity(Path directory)
             throws BackupException, IOException {
         Path verified = requireDirectory(directory);
@@ -704,8 +732,8 @@ public final class BackupRestorer {
         Files.walkFileTree(verified,
             EnumSet.noneOf(java.nio.file.FileVisitOption.class), Integer.MAX_VALUE,
             strictVerificationVisitor(verified, files, directories));
-        return new DirectoryIdentity(attributes.fileKey(), attributes.creationTime(),
-            attributes.lastModifiedTime(), files, directories);
+        return new DirectoryIdentity(attributes.fileKey(), attributes.creationTime(), files,
+            directories);
     }
 
     private static boolean matchesDirectoryIdentity(Path directory,
@@ -720,8 +748,7 @@ public final class BackupRestorer {
             Object observedKey = attributes.fileKey();
             boolean sameRoot = expected.fileKey != null && observedKey != null
                 ? expected.fileKey.equals(observedKey)
-                : expected.creationTime.equals(attributes.creationTime())
-                    && expected.modifiedTime.equals(attributes.lastModifiedTime());
+                : expected.creationTime.equals(attributes.creationTime());
             if (!sameRoot) {
                 return false;
             }
@@ -732,7 +759,7 @@ public final class BackupRestorer {
                 strictVerificationVisitor(verified, files, directories));
             return expected.directories.equals(directories)
                 && sameFingerprints(expected.files, files);
-        } catch (BackupException | IOException invalidDirectory) {
+        } catch (BackupException | IOException | RuntimeException invalidDirectory) {
             return false;
         }
     }

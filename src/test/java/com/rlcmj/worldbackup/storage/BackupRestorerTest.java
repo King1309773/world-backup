@@ -476,6 +476,74 @@ public class BackupRestorerTest {
     }
 
     @Test
+    public void tamperedSafetyAfterCompletedMoveStopsRestoreAndPreservesVerifiedTemporary()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new TamperAfterOriginalMoveOperations(
+                OriginalMoveStage.SAFETY)).restore(fixture.gameDir, fixture.savesDir,
+                    "World1", fixture.repo, chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+        assertFalse(Files.exists(fixture.world, LinkOption.NOFOLLOW_LINKS));
+        assertArrayEquals(bytes("tampered"), Files.readAllBytes(fixture.gameDir
+            .resolve("restore-safety").resolve("World1-20261009-010203-004")
+            .resolve("current.dat")));
+    }
+
+    @Test
+    public void runtimeAfterSafetyMovePreservesVerifiedTemporaryRecovery() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new RuntimeAfterMoveOperations(MoveStage.SAFETY))
+                .restore(fixture.gameDir, fixture.savesDir, "World1", fixture.repo,
+                    chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+    }
+
+    @Test
+    public void unsafeNameDuringOriginalAuthenticationFailsClosedAndPreservesTemporaryRecovery()
+            throws Exception {
+        try {
+            Path probe = temp.newFolder("unsafe-name-probe").toPath()
+                .resolve("unsafe\nname.dat");
+            Files.write(probe, bytes("probe"));
+            Files.delete(probe);
+        } catch (IOException | UnsupportedOperationException | SecurityException
+                 | IllegalArgumentException unavailable) {
+            Assume.assumeNoException("Filesystem does not support the unsafe test name",
+                unavailable);
+        }
+
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new TamperAfterOriginalMoveOperations(
+                OriginalMoveStage.SAFETY_WITH_UNSAFE_NAME)).restore(fixture.gameDir,
+                    fixture.savesDir, "World1", fixture.repo, chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+    }
+
+    @Test
     public void promotionMoveThatCompletesBeforeThrowIsVerifiedAndAccepted() throws Exception {
         Fixture fixture = fixture();
         Chain chain = fixture.chain(true);
@@ -624,6 +692,63 @@ public class BackupRestorerTest {
             .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
         assertFalse(Files.exists(fixture.gameDir.resolve("worldbackup-tmp")
             .resolve("World1-fixed-id"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void tamperedWorldAfterCompletedRollbackPreservesVerifiedTemporaryRecovery()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new TamperAfterOriginalMoveOperations(
+                OriginalMoveStage.ROLLBACK)).restore(fixture.gameDir, fixture.savesDir,
+                    "World1", fixture.repo, chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+        assertArrayEquals(bytes("tampered"),
+            Files.readAllBytes(fixture.world.resolve("current.dat")));
+        assertFalse(Files.exists(fixture.gameDir.resolve("restore-safety")
+            .resolve("World1-20261009-010203-004"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void tamperedSafetyDuringPromotionIsRejectedBeforeSuccessfulReturn()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer(new TamperAfterOriginalMoveOperations(
+                OriginalMoveStage.SAFETY_DURING_PROMOTION)).restore(fixture.gameDir,
+                    fixture.savesDir, "World1", fixture.repo, chain.v3.getId()));
+
+        Path recovery = fixture.gameDir.resolve("worldbackup-tmp")
+            .resolve("World1-fixed-id").toAbsolutePath().normalize();
+        assertEquals("worldbackup.error.restore_rollback", error.getTranslationKey());
+        assertEquals(recovery.toString(), error.getArguments()[0]);
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(recovery.resolve("level.dat")));
+        assertArrayEquals(bytes("tampered"),
+            Files.readAllBytes(fixture.world.resolve("current.dat")));
+    }
+
+    @Test
+    public void rootSessionLockMayChangeDuringOriginalAuthentication() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+
+        Path restored = fixture.restorer(new TamperAfterOriginalMoveOperations(
+            OriginalMoveStage.SESSION_LOCK_DURING_PROMOTION)).restore(fixture.gameDir,
+                fixture.savesDir, "World1", fixture.repo, chain.v3.getId());
+
+        assertArrayEquals(bytes("newest"), Files.readAllBytes(restored.resolve("level.dat")));
+        assertArrayEquals(bytes("live lock"), Files.readAllBytes(fixture.gameDir
+            .resolve("restore-safety").resolve("World1-20261009-010203-004")
+            .resolve("session.lock")));
     }
 
     @Test
@@ -948,6 +1073,76 @@ public class BackupRestorerTest {
     }
 
     private enum MoveStage { SAFETY, PROMOTION, ROLLBACK }
+
+    private enum OriginalMoveStage {
+        SAFETY, SAFETY_WITH_UNSAFE_NAME, SAFETY_DURING_PROMOTION,
+        SESSION_LOCK_DURING_PROMOTION, ROLLBACK
+    }
+
+    private static final class TamperAfterOriginalMoveOperations
+            implements BackupRestorer.MoveOperations {
+        private final OriginalMoveStage tamperAfter;
+        private Path safety;
+
+        private TamperAfterOriginalMoveOperations(OriginalMoveStage tamperAfter) {
+            this.tamperAfter = tamperAfter;
+        }
+
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(),
+                    "exercise fallback");
+            }
+            boolean promotion = source.toString().contains("worldbackup-tmp");
+            boolean rollback = source.toString().contains("restore-safety");
+            if (promotion && tamperAfter == OriginalMoveStage.ROLLBACK) {
+                throw new IOException("injected promotion failure before move");
+            }
+            Files.move(source, target, options);
+            if (!promotion && !rollback) {
+                safety = target;
+            }
+            if ((tamperAfter == OriginalMoveStage.SAFETY && !promotion && !rollback)
+                    || (tamperAfter == OriginalMoveStage.ROLLBACK && rollback)
+                    || (tamperAfter == OriginalMoveStage.SAFETY_DURING_PROMOTION
+                        && promotion)) {
+                Path tamperTarget = tamperAfter == OriginalMoveStage.SAFETY_DURING_PROMOTION
+                    ? safety : target;
+                Files.write(tamperTarget.resolve("current.dat"), bytes("tampered"));
+            } else if (tamperAfter == OriginalMoveStage.SAFETY_WITH_UNSAFE_NAME
+                    && !promotion && !rollback) {
+                Files.write(target.resolve("current.dat"), bytes("tampered"));
+                Files.write(target.resolve("unsafe\nname.dat"), bytes("unsafe"));
+            } else if (tamperAfter == OriginalMoveStage.SESSION_LOCK_DURING_PROMOTION
+                    && promotion) {
+                Files.write(safety.resolve("session.lock"), bytes("live lock"));
+            }
+        }
+    }
+
+    private static final class RuntimeAfterMoveOperations
+            implements BackupRestorer.MoveOperations {
+        private final MoveStage throwAfter;
+
+        private RuntimeAfterMoveOperations(MoveStage throwAfter) {
+            this.throwAfter = throwAfter;
+        }
+
+        @Override
+        public void move(Path source, Path target, CopyOption... options) throws IOException {
+            if (Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE)) {
+                throw new AtomicMoveNotSupportedException(source.toString(), target.toString(),
+                    "exercise fallback");
+            }
+            Files.move(source, target, options);
+            boolean safety = !source.toString().contains("worldbackup-tmp")
+                && !source.toString().contains("restore-safety");
+            if (throwAfter == MoveStage.SAFETY && safety) {
+                throw new IllegalStateException("injected runtime after safety move");
+            }
+        }
+    }
 
     private enum RecoveryDamage {
         TEMP_DAMAGED, TEMP_LINK, TEMP_DELETED, SAFETY_LINK, SAFETY_DAMAGED
