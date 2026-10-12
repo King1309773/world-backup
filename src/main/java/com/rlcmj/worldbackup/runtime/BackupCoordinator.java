@@ -190,13 +190,15 @@ public final class BackupCoordinator {
             backup.preparationDone.complete(null);
             return;
         }
+        boolean consumePreparationInterrupt = false;
         try {
-            backup.preparationThread = Thread.currentThread();
+            backup.startPreparation(Thread.currentThread());
             try {
                 backup.prepared = runtime.prepareSnapshot(backup.server,
                     backup.cancellation);
             } finally {
-                backup.preparationThread = null;
+                consumePreparationInterrupt =
+                    backup.finishPreparation(Thread.currentThread());
             }
             backup.stageTask = stagingWorker.submit(() -> stageSnapshot(backup));
             backup.snapshot = awaitStaging(backup);
@@ -223,6 +225,14 @@ public final class BackupCoordinator {
             if (backup.workerTask == null) backup.workerDone.complete(null);
             if (!backup.terminal.get()) failBeforeWorker(backup, failure);
         } finally {
+            if (consumePreparationInterrupt) {
+                // Preparation rollback has completed on this server thread. Consume only
+                // the interrupt attributed to our watchdog before returning to its loop.
+                // Java has one interrupt bit and cannot distinguish an exactly concurrent
+                // external interrupt; the synchronized handshake prevents our watchdog from
+                // delivering a late interrupt after the preparation cleanup boundary.
+                Thread.interrupted();
+            }
             backup.preparationDone.complete(null);
         }
     }
@@ -320,8 +330,7 @@ public final class BackupCoordinator {
         if (task != null) task.cancel(true);
         Thread staging = backup.stageThread;
         if (staging != null) staging.interrupt();
-        Thread preparation = backup.preparationThread;
-        if (preparation != null) preparation.interrupt();
+        backup.interruptPreparation();
         if (cancelledBeforeStart && task != null) {
             backup.workerDone.complete(null);
         }
@@ -562,7 +571,9 @@ public final class BackupCoordinator {
         private volatile BackupJob job;
         private volatile Future<?> workerTask;
         private volatile Future<?> stageTask;
-        private volatile Thread preparationThread;
+        private Thread preparationThread;
+        private boolean preparationInterruptedOnEntry;
+        private boolean preparationInterruptOwned;
         private volatile Thread stageThread;
         private volatile Cancellable watchdog;
         private volatile Completion completion;
@@ -575,6 +586,29 @@ public final class BackupCoordinator {
             stageDone.complete(null);
             workerDone.complete(null);
             return true;
+        }
+
+        private synchronized void startPreparation(Thread thread) {
+            preparationThread = thread;
+            preparationInterruptedOnEntry = thread.isInterrupted();
+            preparationInterruptOwned = false;
+        }
+
+        private synchronized void interruptPreparation() {
+            Thread thread = preparationThread;
+            if (thread == null) return;
+            preparationInterruptOwned = true;
+            thread.interrupt();
+        }
+
+        private synchronized boolean finishPreparation(Thread thread) {
+            if (preparationThread != thread) return false;
+            preparationThread = null;
+            boolean consume = preparationInterruptOwned
+                && !preparationInterruptedOnEntry;
+            preparationInterruptOwned = false;
+            preparationInterruptedOnEntry = false;
+            return consume;
         }
 
         private ActiveBackup(Object server, BackupTrigger trigger, long startedNanos) {

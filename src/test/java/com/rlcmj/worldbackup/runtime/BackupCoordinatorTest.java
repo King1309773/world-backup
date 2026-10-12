@@ -189,10 +189,14 @@ public class BackupCoordinatorTest {
     public void watchdogInterruptsPrepareAndPreventsStaging() throws Exception {
         FakeRuntime runtime = new FakeRuntime();
         runtime.blockPrepareUntilInterrupted = true;
+        runtime.returnFromPrepareWithInterruptSet = true;
         ManualWatchdog watchdog = new ManualWatchdog();
         BackupCoordinator coordinator = coordinator(runtime, watchdog);
-        Thread requester = new Thread(() ->
-            coordinator.request(new Object(), BackupTrigger.MANUAL), "server-thread");
+        AtomicBoolean interruptedAfterReturn = new AtomicBoolean();
+        Thread requester = new Thread(() -> {
+            coordinator.request(new Object(), BackupTrigger.MANUAL);
+            interruptedAfterReturn.set(Thread.currentThread().isInterrupted());
+        }, "server-thread");
         requester.start();
         assertTrue(runtime.prepareEntered.await(2, TimeUnit.SECONDS));
 
@@ -204,10 +208,34 @@ public class BackupCoordinatorTest {
             assertTrue(runtime.prepareFlagsRestored);
             assertEquals(0, runtime.stageCalls);
             await(() -> !coordinator.isActive());
+            assertFalse("coordinator interrupt leaked into the server loop",
+                interruptedAfterReturn.get());
         } finally {
             runtime.prepareRelease.countDown();
             requester.join(2000L);
         }
+    }
+
+    @Test
+    public void externalInterruptAtBeginIsNotConsumedAsCoordinatorOwned() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failPrepareOnExternalInterrupt = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        AtomicBoolean interruptedAfterReturn = new AtomicBoolean();
+        Thread requester = new Thread(() -> {
+            Thread.currentThread().interrupt();
+            coordinator.request(new Object(), BackupTrigger.MANUAL);
+            interruptedAfterReturn.set(Thread.currentThread().isInterrupted());
+            Thread.interrupted();
+        }, "externally-interrupted-server-thread");
+
+        requester.start();
+        requester.join(2000L);
+
+        assertFalse(requester.isAlive());
+        assertTrue(interruptedAfterReturn.get());
+        assertEquals(0, runtime.stageCalls);
+        assertFalse(coordinator.isActive());
     }
 
     @Test
@@ -570,6 +598,8 @@ public class BackupCoordinatorTest {
         private volatile boolean blockStagingUntilReleased;
         private volatile boolean deferFirstSchedule;
         private volatile boolean blockPrepareUntilInterrupted;
+        private volatile boolean returnFromPrepareWithInterruptSet;
+        private volatile boolean failPrepareOnExternalInterrupt;
         private volatile boolean prepareFlagsRestored;
         private volatile Runnable deferredSchedule;
         private volatile int cleanupFailuresRemaining;
@@ -591,8 +621,21 @@ public class BackupCoordinatorTest {
             return new Object();
         }
         @Override public Object prepareSnapshot(Object server) throws Exception {
+            if (failPrepareOnExternalInterrupt && Thread.currentThread().isInterrupted()) {
+                throw new java.io.InterruptedIOException("external interrupt");
+            }
             if (blockPrepareUntilInterrupted) {
                 prepareEntered.countDown();
+                if (returnFromPrepareWithInterruptSet) {
+                    while (!Thread.currentThread().isInterrupted()
+                            && prepareRelease.getCount() != 0L) {
+                        Thread.yield();
+                    }
+                    if (Thread.currentThread().isInterrupted()) {
+                        prepareFlagsRestored = true;
+                        return freeze(server);
+                    }
+                }
                 try {
                     prepareRelease.await();
                 } catch (InterruptedException interrupted) {
