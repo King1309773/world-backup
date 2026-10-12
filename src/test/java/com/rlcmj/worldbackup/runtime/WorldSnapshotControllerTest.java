@@ -14,6 +14,28 @@ import static org.junit.Assert.assertTrue;
 
 public class WorldSnapshotControllerTest {
     @Test
+    public void rejectsOffThreadBeforeCreatingSnapshotAdapter() {
+        List<String> calls = new ArrayList<>();
+        WorldSnapshotController.SnapshotServerFactory factory =
+            new WorldSnapshotController.SnapshotServerFactory() {
+                @Override public void requireServerThread() {
+                    calls.add("thread");
+                    throw new IllegalStateException("off thread");
+                }
+
+                @Override public WorldSnapshotController.SnapshotServer create() {
+                    calls.add("create-adapter");
+                    throw new AssertionError("adapter must not be created off thread");
+                }
+            };
+
+        assertThrows(IllegalStateException.class,
+            () -> new WorldSnapshotController().freeze(factory));
+
+        assertEquals(Arrays.asList("thread"), calls);
+    }
+
+    @Test
     public void freezesInSaveFlushFlagOrderAndFlushesSharedHandlerOnce() throws Exception {
         List<String> calls = new ArrayList<>();
         FakeSave shared = new FakeSave("shared", calls);

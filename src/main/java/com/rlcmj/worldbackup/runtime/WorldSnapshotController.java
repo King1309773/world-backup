@@ -15,11 +15,20 @@ import java.util.Set;
 
 public final class WorldSnapshotController {
     public Handle freeze(MinecraftServer server) throws Exception {
-        return freeze(new MinecraftSnapshotServer(server));
+        return freeze(new MinecraftSnapshotServerFactory(server));
+    }
+
+    Handle freeze(SnapshotServerFactory factory) throws Exception {
+        Objects.requireNonNull(factory, "factory").requireServerThread();
+        return freezeInitialized(Objects.requireNonNull(factory.create(), "snapshotServer"));
     }
 
     Handle freeze(SnapshotServer server) throws Exception {
         Objects.requireNonNull(server, "server").requireServerThread();
+        return freezeInitialized(server);
+    }
+
+    private Handle freezeInitialized(SnapshotServer server) throws Exception {
         List<SnapshotWorld> worlds = new ArrayList<>(server.worlds());
         server.saveAllWorlds();
         server.saveAllPlayers();
@@ -122,6 +131,11 @@ public final class WorldSnapshotController {
         boolean isRunning();
     }
 
+    interface SnapshotServerFactory {
+        void requireServerThread();
+        SnapshotServer create();
+    }
+
     interface SnapshotWorld {
         void saveAllChunks() throws Exception;
         SnapshotSaveHandler saveHandler();
@@ -166,9 +180,7 @@ public final class WorldSnapshotController {
         }
 
         @Override public void requireServerThread() {
-            if (!server.isCallingFromMinecraftThread()) {
-                throw new IllegalStateException("World snapshot operation must run on server thread");
-            }
+            requireMinecraftServerThread(server);
         }
         @Override public void saveAllWorlds() { server.saveAllWorlds(false); }
         @Override public void saveAllPlayers() { server.getPlayerList().saveAllPlayerData(); }
@@ -181,6 +193,30 @@ public final class WorldSnapshotController {
         }
         @Override public boolean isRunning() {
             return server.isServerRunning() && !server.isServerStopped();
+        }
+    }
+
+    private static final class MinecraftSnapshotServerFactory
+            implements SnapshotServerFactory {
+        private final MinecraftServer server;
+
+        private MinecraftSnapshotServerFactory(MinecraftServer server) {
+            this.server = Objects.requireNonNull(server, "server");
+        }
+
+        @Override public void requireServerThread() {
+            requireMinecraftServerThread(server);
+        }
+
+        @Override public SnapshotServer create() {
+            return new MinecraftSnapshotServer(server);
+        }
+    }
+
+    private static void requireMinecraftServerThread(MinecraftServer server) {
+        if (!server.isCallingFromMinecraftThread()) {
+            throw new IllegalStateException(
+                "World snapshot operation must run on server thread");
         }
     }
 
