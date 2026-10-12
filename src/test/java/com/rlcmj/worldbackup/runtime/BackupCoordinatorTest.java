@@ -467,6 +467,59 @@ public class BackupCoordinatorTest {
             runtime.messageArguments.get(runtime.messageArguments.size() - 1).length);
     }
 
+    @Test
+    public void restoreAndBackupRequestsAreMutuallyExclusiveAndRestoreCompletesOnClientThread()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch completed = new CountDownLatch(1);
+
+        assertTrue(coordinator.requestRestore(() -> {
+            entered.countDown();
+            release.await();
+            return Paths.get("restored");
+        }, new BackupCoordinator.RestoreCallback() {
+            @Override public void succeeded(java.nio.file.Path restored) {
+                assertEquals(Paths.get("restored"), restored);
+                assertFalse(coordinator.isBusy());
+                completed.countDown();
+            }
+            @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
+        }));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        assertFalse(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        assertFalse(coordinator.requestRestore(() -> Paths.get("other"),
+            new BackupCoordinator.RestoreCallback() {
+                @Override public void succeeded(java.nio.file.Path restored) { }
+                @Override public void failed(Throwable failure) { }
+            }));
+        release.countDown();
+        assertTrue(completed.await(2, TimeUnit.SECONDS));
+        assertFalse(coordinator.isBusy());
+    }
+
+    @Test
+    public void activeBackupRejectsRestoreRequest() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.blockBackup = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        coordinator.request(new Object(), BackupTrigger.MANUAL);
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+
+        assertFalse(coordinator.requestRestore(() -> Paths.get("restored"),
+            new BackupCoordinator.RestoreCallback() {
+                @Override public void succeeded(java.nio.file.Path restored) { }
+                @Override public void failed(Throwable failure) { }
+            }));
+        runtime.backupRelease.countDown();
+    }
+
     private BackupCoordinator coordinator(FakeRuntime runtime, ManualWatchdog watchdog) {
         return coordinator(runtime, watchdog, System::nanoTime);
     }

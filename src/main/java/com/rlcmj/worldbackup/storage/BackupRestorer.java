@@ -207,6 +207,26 @@ public final class BackupRestorer {
         }
     }
 
+    public void validateAvailability(Path repository, String worldId,
+                                     String targetVersionId) throws BackupException {
+        Objects.requireNonNull(repository, "repository");
+        requireText(targetVersionId, "targetVersionId");
+        try {
+            String safeWorldId = PortablePaths.requireSafeBasename(worldId);
+            Path repo = requireDirectory(repository);
+            validateCatalogFile(repo);
+            BackupCatalog catalog = catalogStore.load(repo);
+            if (!safeWorldId.equals(catalog.getWorldId())) {
+                throw new BackupException("worldbackup.error.catalog_mismatch");
+            }
+            validateArchives(repo, resolveChain(catalog, targetVersionId));
+        } catch (BackupException failure) {
+            throw failure;
+        } catch (IllegalArgumentException | NullPointerException failure) {
+            throw new BackupException("worldbackup.error.path_escape", failure);
+        }
+    }
+
     private List<BackupVersion> resolveChain(BackupCatalog catalog, String targetId)
             throws BackupException {
         Map<String, BackupVersion> byId = new HashMap<>();

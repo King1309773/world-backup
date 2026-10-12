@@ -46,12 +46,25 @@ public final class RetentionPlanner {
             }
         }
 
+        return planKeepingVisibleIds(source, visibleIds);
+    }
+
+    public Plan planKeepingVisibleIds(BackupCatalog source, Set<String> visibleIds) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(visibleIds, "visibleIds");
+        Set<String> selected = new LinkedHashSet<>(visibleIds);
         Map<String, BackupVersion> byId = new HashMap<>();
         for (BackupVersion version : source.getVersions()) {
             byId.put(version.getId(), version);
         }
-        Set<String> reachable = new HashSet<>(visibleIds);
-        for (String visibleId : visibleIds) {
+        for (String id : selected) {
+            BackupVersion version = byId.get(id);
+            if (version == null || !version.isVisible()) {
+                throw new IllegalArgumentException("unknown visible version: " + id);
+            }
+        }
+        Set<String> reachable = new HashSet<>(selected);
+        for (String visibleId : selected) {
             markParents(visibleId, byId, reachable);
         }
 
@@ -59,7 +72,7 @@ public final class RetentionPlanner {
         Set<String> retainedArchives = new HashSet<>();
         for (BackupVersion version : source.getVersions()) {
             if (reachable.contains(version.getId())) {
-                retained.add(copyWithVisibility(version, visibleIds.contains(version.getId())));
+                retained.add(copyWithVisibility(version, selected.contains(version.getId())));
                 retainedArchives.add(version.getArchiveName());
             }
         }

@@ -105,6 +105,26 @@ public class RetentionPlannerTest {
         new RetentionPlanner().plan(BackupCatalog.empty("World1", "My World"), 0);
     }
 
+    @Test
+    public void removingOneVisibleVersionKeepsEveryOtherVisibleDependencyChain() {
+        BackupCatalog catalog = BackupCatalog.empty("World1", "My World");
+        catalog.add(full("base", 1L, BackupMode.FULL));
+        catalog.add(delta("d1", 2L, "base", "base", false));
+        catalog.add(delta("remove", 3L, "d1", "base", true));
+        catalog.add(delta("keep", 4L, "d1", "base", true));
+        catalog.add(full("other", 5L, BackupMode.FULL));
+
+        RetentionPlanner.Plan plan = new RetentionPlanner().planKeepingVisibleIds(
+            catalog, new HashSet<>(Arrays.asList("keep", "other")));
+
+        assertEquals(new HashSet<>(Arrays.asList("base", "d1", "keep", "other")),
+            ids(plan));
+        assertEquals(Collections.singletonList("remove-delta.zip"),
+            plan.getArchiveNamesToDelete());
+        assertTrue(find(plan, "keep").isVisible());
+        assertFalse(find(plan, "d1").isVisible());
+    }
+
     private static BackupVersion full(String id, long time, BackupMode mode) {
         String suffix = mode == BackupMode.OVERWRITE ? "-latest.zip" : "-full.zip";
         return new BackupVersion(id, time, BackupTrigger.MANUAL, mode, id + suffix,

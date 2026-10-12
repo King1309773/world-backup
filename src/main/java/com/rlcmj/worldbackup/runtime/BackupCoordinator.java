@@ -42,6 +42,8 @@ public final class BackupCoordinator {
     private final long timeoutNanos;
     private final long shutdownWaitNanos;
     private final AtomicReference<ActiveBackup> active = new AtomicReference<>();
+    private final AtomicBoolean restoreActive = new AtomicBoolean();
+    private final Object arbitration = new Object();
 
     public BackupCoordinator() {
         this(new MinecraftRuntime(), newDaemonExecutor("World Backup Worker"),
@@ -72,9 +74,11 @@ public final class BackupCoordinator {
             return false;
         }
         ActiveBackup candidate = new ActiveBackup(server, trigger, clock.nanoTime());
-        if (!active.compareAndSet(null, candidate)) {
-            runtime.message("worldbackup.message.busy");
-            return false;
+        synchronized (arbitration) {
+            if (restoreActive.get() || !active.compareAndSet(null, candidate)) {
+                runtime.message("worldbackup.message.busy");
+                return false;
+            }
         }
         runtime.message("worldbackup.message.start");
         try {
@@ -87,6 +91,61 @@ public final class BackupCoordinator {
             failBeforeWorker(candidate, schedulingFailure);
         }
         return true;
+    }
+
+    public boolean requestRestore(RestoreOperation operation, RestoreCallback callback) {
+        Objects.requireNonNull(operation, "operation");
+        Objects.requireNonNull(callback, "callback");
+        synchronized (arbitration) {
+            if (active.get() != null || !restoreActive.compareAndSet(false, true)) {
+                runtime.message("worldbackup.message.busy");
+                return false;
+            }
+        }
+        try {
+            worker.submit(() -> {
+                Path restored = null;
+                Throwable failure = null;
+                try {
+                    restored = operation.run();
+                } catch (Throwable restoreFailure) {
+                    failure = restoreFailure;
+                }
+                final Path completedPath = restored;
+                final Throwable completedFailure = failure;
+                try {
+                    runtime.scheduleClient(() -> {
+                        restoreActive.set(false);
+                        if (completedFailure == null) callback.succeeded(completedPath);
+                        else callback.failed(completedFailure);
+                    });
+                } catch (Throwable schedulingFailure) {
+                    restoreActive.set(false);
+                    callback.failed(schedulingFailure);
+                }
+            });
+        } catch (Throwable submissionFailure) {
+            restoreActive.set(false);
+            callback.failed(submissionFailure);
+            return false;
+        }
+        return true;
+    }
+
+    public boolean isBusy() {
+        return active.get() != null || restoreActive.get();
+    }
+
+    public boolean isRestoreActive() {
+        return restoreActive.get();
+    }
+
+    @FunctionalInterface
+    public interface RestoreOperation { Path run() throws Exception; }
+
+    public interface RestoreCallback {
+        void succeeded(Path restored);
+        void failed(Throwable failure);
     }
 
     public void onServerStopping(MinecraftServer server) {
@@ -533,6 +592,7 @@ public final class BackupCoordinator {
             throws Exception;
         BackupResult run(BackupJob job, BackupCancellation cancellation) throws Exception;
         void schedule(Object server, Runnable command);
+        default void scheduleClient(Runnable command) { command.run(); }
         void message(String key, Object... arguments);
     }
 
@@ -716,6 +776,9 @@ public final class BackupCoordinator {
         }
         @Override public void schedule(Object server, Runnable command) {
             ((MinecraftServer) server).addScheduledTask(command);
+        }
+        @Override public void scheduleClient(Runnable command) {
+            Minecraft.getMinecraft().addScheduledTask(command);
         }
         @Override public void message(String key, Object... arguments) {
             ClientMessages.send(key, arguments);

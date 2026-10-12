@@ -1,22 +1,32 @@
 package com.rlcmj.worldbackup.runtime;
 
 import com.rlcmj.worldbackup.config.WorldBackupConfig;
+import com.rlcmj.worldbackup.client.GuiBackupManager;
 import com.rlcmj.worldbackup.core.BackupTrigger;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiButton;
+import net.minecraft.client.gui.GuiListWorldSelectionEntry;
+import net.minecraft.client.gui.GuiWorldSelection;
+import net.minecraft.client.resources.I18n;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.server.integrated.IntegratedServer;
 import net.minecraftforge.fml.client.registry.ClientRegistry;
+import net.minecraftforge.client.event.GuiScreenEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import org.lwjgl.input.Keyboard;
 
 import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.WeakHashMap;
 
 public final class ClientEventHandler {
+    private static final int MANAGE_BACKUPS = 0x5742;
     private final BackupCoordinator coordinator;
     private final KeyBinding manualBackup = new KeyBinding("key.worldbackup.manual",
         Keyboard.KEY_NONE, "key.categories.worldbackup");
     private final BackupTimer timer = new BackupTimer();
+    private final Map<GuiWorldSelection, GuiButton> managerButtons = new WeakHashMap<>();
 
     public ClientEventHandler(BackupCoordinator coordinator) {
         this.coordinator = coordinator;
@@ -40,6 +50,39 @@ public final class ClientEventHandler {
         if (timer.due(scheduled ? server : null, scheduled, interval, System.nanoTime())) {
             coordinator.request(server, BackupTrigger.SCHEDULED);
         }
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionInit(GuiScreenEvent.InitGuiEvent.Post event) {
+        if (!(event.getGui() instanceof GuiWorldSelection)) return;
+        GuiButton button = new GuiButton(MANAGE_BACKUPS, event.getGui().width - 105, 8,
+            100, 20, I18n.format("gui.worldbackup.manage"));
+        button.enabled = selected((GuiWorldSelection) event.getGui()) != null;
+        event.getButtonList().add(button);
+        managerButtons.put((GuiWorldSelection) event.getGui(), button);
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionDraw(GuiScreenEvent.DrawScreenEvent.Pre event) {
+        if (!(event.getGui() instanceof GuiWorldSelection)) return;
+        GuiWorldSelection screen = (GuiWorldSelection) event.getGui();
+        GuiButton button = managerButtons.get(screen);
+        if (button != null) button.enabled = selected(screen) != null;
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionAction(GuiScreenEvent.ActionPerformedEvent.Post event) {
+        if (!(event.getGui() instanceof GuiWorldSelection)
+                || event.getButton().id != MANAGE_BACKUPS) return;
+        GuiListWorldSelectionEntry entry = selected((GuiWorldSelection) event.getGui());
+        if (entry != null) {
+            Minecraft.getMinecraft().displayGuiScreen(new GuiBackupManager(event.getGui(),
+                entry.worldSummary.getFileName(), coordinator));
+        }
+    }
+
+    private static GuiListWorldSelectionEntry selected(GuiWorldSelection screen) {
+        return screen.selectionList == null ? null : screen.selectionList.getSelectedWorld();
     }
 
     static final class BackupTimer {

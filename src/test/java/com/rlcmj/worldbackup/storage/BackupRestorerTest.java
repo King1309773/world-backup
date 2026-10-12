@@ -60,6 +60,23 @@ public class BackupRestorerTest {
     }
 
     @Test
+    public void availabilityValidationReadsEntireDependencyChainWithoutChangingWorld()
+            throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+        byte[] before = Files.readAllBytes(fixture.world.resolve("current.dat"));
+
+        fixture.restorer().validateAvailability(fixture.repo, "World1", chain.v3.getId());
+
+        assertArrayEquals(before, Files.readAllBytes(fixture.world.resolve("current.dat")));
+        Files.write(fixture.repo.resolve(chain.v2.getArchiveName()), new byte[] { 1, 2, 3 });
+        BackupException error = assertThrows(BackupException.class,
+            () -> fixture.restorer().validateAvailability(
+                fixture.repo, "World1", chain.v3.getId()));
+        assertEquals("worldbackup.error.archive_corrupt", error.getTranslationKey());
+    }
+
+    @Test
     public void restoresAnOlderTargetUsingHiddenDependenciesInsteadOfLatestVersion()
             throws Exception {
         Fixture fixture = fixture();
