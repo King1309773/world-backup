@@ -108,6 +108,37 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void failedCancellationRollbackPreservesCatalogRecoveryBackup() throws Exception {
+        Path repo = temp.newFolder("blocked-catalog-rollback-failure").toPath();
+        Path index = repo.resolve("index.json");
+        Path backup = repo.resolve("index.json.bak");
+        Files.write(index, "old index".getBytes(StandardCharsets.UTF_8));
+        BackupCancellation cancellation = new BackupCancellation();
+        BlockingFileOperations operations = new BlockingFileOperations(true);
+        CatalogStore store = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard, operations));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try {
+                store.save(repo, BackupCatalog.empty("world", "World"), cancellation);
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "failed-catalog-rollback");
+        writer.start();
+        assertTrue(operations.moved.await(2, TimeUnit.SECONDS));
+        cancellation.cancel();
+        operations.release.countDown();
+        writer.join(2000L);
+
+        assertFalse(writer.isAlive());
+        assertTrue(failure.get() instanceof BackupException);
+        assertTrue(Files.exists(backup));
+        assertEquals("old index",
+            new String(Files.readAllBytes(backup), StandardCharsets.UTF_8));
+    }
+
+    @Test
     public void cancelledBackupCannotCrossCatalogPublishGate() throws Exception {
         Path repo = temp.newFolder("cancelled-publish").toPath();
         BackupCancellation cancellation = new BackupCancellation();
@@ -950,6 +981,12 @@ public class CatalogStoreTest {
     private static final class BlockingFileOperations implements AtomicFiles.FileOperations {
         private final CountDownLatch moved = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
+        private final boolean failRollbackCopy;
+
+        private BlockingFileOperations() { this(false); }
+        private BlockingFileOperations(boolean failRollbackCopy) {
+            this.failRollbackCopy = failRollbackCopy;
+        }
 
         @Override public void move(Path source, Path target, CopyOption... options)
                 throws IOException {
@@ -965,6 +1002,9 @@ public class CatalogStoreTest {
 
         @Override public void copy(Path source, Path target, CopyOption... options)
                 throws IOException {
+            if (failRollbackCopy && source.getFileName().toString().endsWith(".bak")) {
+                throw new IOException("rollback copy failed");
+            }
             Files.copy(source, target, options);
         }
 

@@ -59,7 +59,7 @@ public final class WorldSnapshotController {
     }
 
     private Handle freezeInitialized(SnapshotServer server) throws Exception {
-        Prepared prepared = prepareInitialized(server);
+        Prepared prepared = prepareInitialized(server, new BackupCancellation());
         try {
             return stage(prepared, new BackupCancellation());
         } catch (Exception failure) {
@@ -73,39 +73,67 @@ public final class WorldSnapshotController {
     }
 
     public Prepared prepare(MinecraftServer server) throws Exception {
-        MinecraftSnapshotServerFactory factory = new MinecraftSnapshotServerFactory(server);
-        factory.requireServerThread();
-        return prepareInitialized(factory.create());
+        return prepare(server, new BackupCancellation());
     }
 
-    private Prepared prepareInitialized(SnapshotServer server) throws Exception {
+    public Prepared prepare(MinecraftServer server, BackupCancellation cancellation)
+            throws Exception {
+        MinecraftSnapshotServerFactory factory = new MinecraftSnapshotServerFactory(server);
+        factory.requireServerThread();
+        return prepareInitialized(factory.create(), cancellation);
+    }
+
+    private Prepared prepareInitialized(SnapshotServer server,
+                                        BackupCancellation cancellation) throws Exception {
+        Objects.requireNonNull(cancellation, "cancellation");
+        checkPreparation(cancellation);
         List<SnapshotWorld> worlds = new ArrayList<>(server.worlds());
+        checkPreparation(cancellation);
         server.saveAllWorlds();
+        checkPreparation(cancellation);
         server.saveAllPlayers();
+        checkPreparation(cancellation);
         for (SnapshotWorld world : worlds) {
+            checkPreparation(cancellation);
             world.saveAllChunks();
+            checkPreparation(cancellation);
         }
         Set<SnapshotSaveHandler> handlers = Collections.newSetFromMap(
             new IdentityHashMap<SnapshotSaveHandler, Boolean>());
         for (SnapshotWorld world : worlds) {
+            checkPreparation(cancellation);
             SnapshotSaveHandler handler = world.saveHandler();
+            checkPreparation(cancellation);
             if (handlers.add(handler)) {
                 handler.flush();
+                checkPreparation(cancellation);
             }
         }
 
         List<WorldState> states = new ArrayList<>();
         try {
             for (SnapshotWorld world : worlds) {
+                checkPreparation(cancellation);
                 WorldState state = new WorldState(world, world.isSavingDisabled());
                 states.add(state);
+                checkPreparation(cancellation);
                 world.setSavingDisabled(true);
+                checkPreparation(cancellation);
             }
             Path sourceWorld = server.worldDirectory();
+            checkPreparation(cancellation);
             return new Prepared(server, sourceWorld, states);
         } catch (Exception failure) {
             restoreChangedFlags(states, failure);
             throw failure;
+        }
+    }
+
+    private static void checkPreparation(BackupCancellation cancellation)
+            throws java.io.InterruptedIOException {
+        cancellation.check();
+        if (Thread.currentThread().isInterrupted()) {
+            throw new java.io.InterruptedIOException("Snapshot preparation interrupted");
         }
     }
 

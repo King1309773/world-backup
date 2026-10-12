@@ -373,6 +373,32 @@ public class WorldSnapshotControllerTest {
             calls.subList(calls.size() - 2, calls.size()));
     }
 
+    @Test
+    public void interruptedFlagPreparationRestoresChangedFlagsBeforeStaging() {
+        List<String> calls = new ArrayList<>();
+        FakeWorld first = new FakeWorld("one", false, new FakeSave("a", calls), calls);
+        FakeWorld second = new FakeWorld("two", false, new FakeSave("b", calls), calls);
+        first.interruptAfterSetting = true;
+        FakeServer server = new FakeServer(calls, first, second);
+        AtomicInteger stagingCalls = new AtomicInteger();
+        WorldSnapshotController controller = new WorldSnapshotController(source -> {
+            stagingCalls.incrementAndGet();
+            throw new AssertionError("cancelled preparation reached staging");
+        });
+
+        try {
+            assertThrows(java.io.InterruptedIOException.class,
+                () -> controller.freeze(server));
+        } finally {
+            Thread.interrupted();
+        }
+
+        assertFalse(first.disabled);
+        assertFalse(second.disabled);
+        assertEquals(0, stagingCalls.get());
+        assertTrue(calls.contains("flag-one-false"));
+    }
+
     private static WorldSnapshotController controllerWithoutCopy() {
         return new WorldSnapshotController(source -> new WorldSnapshotController.StagedSnapshot() {
             @Override public java.nio.file.Path root() { return source; }
@@ -422,6 +448,7 @@ public class WorldSnapshotControllerTest {
         private final List<String> calls;
         private boolean disabled;
         private boolean failWhenSetting;
+        private boolean interruptAfterSetting;
 
         private FakeWorld(String name, boolean disabled, FakeSave save, List<String> calls) {
             this.name = name;
@@ -437,6 +464,7 @@ public class WorldSnapshotControllerTest {
             calls.add("flag-" + name + "-" + value);
             if (failWhenSetting && value) throw new Exception("set failed");
             disabled = value;
+            if (interruptAfterSetting && value) Thread.currentThread().interrupt();
         }
     }
 }

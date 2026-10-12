@@ -105,6 +105,7 @@ public final class BackupCoordinator {
         try {
             if (ownsActive) {
                 current.cancelWatchdog();
+                current.cancelQueuedPreparation();
                 cancelWorker(current);
                 snapshot = current.snapshot;
                 try {
@@ -181,6 +182,8 @@ public final class BackupCoordinator {
     }
 
     private void begin(ActiveBackup backup) {
+        if (!backup.preparationState.compareAndSet(ActiveBackup.PREPARATION_QUEUED,
+                ActiveBackup.PREPARATION_CLAIMED)) return;
         if (backup.shutdown.get() || backup.terminal.get()) {
             backup.stageDone.complete(null);
             backup.workerDone.complete(null);
@@ -188,7 +191,13 @@ public final class BackupCoordinator {
             return;
         }
         try {
-            backup.prepared = runtime.prepareSnapshot(backup.server);
+            backup.preparationThread = Thread.currentThread();
+            try {
+                backup.prepared = runtime.prepareSnapshot(backup.server,
+                    backup.cancellation);
+            } finally {
+                backup.preparationThread = null;
+            }
             backup.stageTask = stagingWorker.submit(() -> stageSnapshot(backup));
             backup.snapshot = awaitStaging(backup);
             if (backup.terminal.get()) {
@@ -209,6 +218,7 @@ public final class BackupCoordinator {
             }
             backup.workerTask = worker.submit(() -> runWorker(backup));
         } catch (Throwable failure) {
+            if (backup.stageTask == null) backup.stageDone.complete(null);
             releasePreparedWorlds(backup, failure);
             if (backup.workerTask == null) backup.workerDone.complete(null);
             if (!backup.terminal.get()) failBeforeWorker(backup, failure);
@@ -310,6 +320,8 @@ public final class BackupCoordinator {
         if (task != null) task.cancel(true);
         Thread staging = backup.stageThread;
         if (staging != null) staging.interrupt();
+        Thread preparation = backup.preparationThread;
+        if (preparation != null) preparation.interrupt();
         if (cancelledBeforeStart && task != null) {
             backup.workerDone.complete(null);
         }
@@ -488,6 +500,13 @@ public final class BackupCoordinator {
         default Object prepareSnapshot(Object server) throws Exception {
             return freeze(server);
         }
+        default Object prepareSnapshot(Object server,
+                                       BackupCancellation cancellation) throws Exception {
+            cancellation.check();
+            Object prepared = prepareSnapshot(server);
+            cancellation.check();
+            return prepared;
+        }
         default Object stageSnapshot(Object prepared,
                                      BackupCancellation cancellation) throws Exception {
             cancellation.check();
@@ -517,6 +536,9 @@ public final class BackupCoordinator {
         private static final int WORKER_RUNNING = 1;
         private static final int WORKER_CANCELLED = 2;
         private static final int WORKER_DONE = 3;
+        private static final int PREPARATION_QUEUED = 0;
+        private static final int PREPARATION_CLAIMED = 1;
+        private static final int PREPARATION_CANCELLED = 2;
 
         private final Object server;
         private final BackupTrigger trigger;
@@ -529,6 +551,8 @@ public final class BackupCoordinator {
         private final CompletableFuture<Void> workerDone = new CompletableFuture<>();
         private final AtomicBoolean terminal = new AtomicBoolean();
         private final AtomicInteger workerState = new AtomicInteger(WORKER_PENDING);
+        private final AtomicInteger preparationState =
+            new AtomicInteger(PREPARATION_QUEUED);
         private final AtomicBoolean shutdown = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
         private final AtomicBoolean finishRunning = new AtomicBoolean();
@@ -538,10 +562,20 @@ public final class BackupCoordinator {
         private volatile BackupJob job;
         private volatile Future<?> workerTask;
         private volatile Future<?> stageTask;
+        private volatile Thread preparationThread;
         private volatile Thread stageThread;
         private volatile Cancellable watchdog;
         private volatile Completion completion;
         private volatile boolean worldsReleased;
+
+        private boolean cancelQueuedPreparation() {
+            if (!preparationState.compareAndSet(PREPARATION_QUEUED,
+                    PREPARATION_CANCELLED)) return false;
+            preparationDone.complete(null);
+            stageDone.complete(null);
+            workerDone.complete(null);
+            return true;
+        }
 
         private ActiveBackup(Object server, BackupTrigger trigger, long startedNanos) {
             this.server = server;
@@ -602,8 +636,10 @@ public final class BackupCoordinator {
         @Override public Object freeze(Object server) throws Exception {
             return snapshots.freeze((MinecraftServer) server);
         }
-        @Override public Object prepareSnapshot(Object server) throws Exception {
-            return snapshots.prepare((MinecraftServer) server);
+        @Override public Object prepareSnapshot(Object server,
+                                                BackupCancellation cancellation)
+                throws Exception {
+            return snapshots.prepare((MinecraftServer) server, cancellation);
         }
         @Override public Object stageSnapshot(Object prepared,
                                               BackupCancellation cancellation)

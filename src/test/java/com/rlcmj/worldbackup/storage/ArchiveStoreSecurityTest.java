@@ -218,6 +218,50 @@ public class ArchiveStoreSecurityTest {
     }
 
     @Test
+    public void failedCancellationRollbackPreservesNamedRecoveryArchive()
+            throws Exception {
+        Path world = temp.newFolder("failed-rollback-world").toPath();
+        write(world.resolve("level.dat"), "old");
+        Path repo = temp.newFolder("failed-rollback-repo").toPath();
+        new ArchiveStore().write(repo, "same.zip", world, manifest(world, "level.dat"),
+            Collections.singletonList("level.dat"), Collections.emptyList(),
+            new BackupCancellation());
+        byte[] original = Files.readAllBytes(repo.resolve("same.zip"));
+        write(world.resolve("level.dat"), "new");
+
+        BackupCancellation cancellation = new BackupCancellation();
+        FailingRollbackAtomicMove operations = new FailingRollbackAtomicMove();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try {
+                new ArchiveStore(operations).write(repo, "same.zip", world,
+                    manifest(world, "level.dat"), Collections.singletonList("level.dat"),
+                    Collections.emptyList(), cancellation);
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "failed-archive-rollback");
+        writer.start();
+        assertTrue(operations.published.await(2, TimeUnit.SECONDS));
+        cancellation.cancel();
+        operations.release.countDown();
+        writer.join(2000L);
+
+        assertFalse(writer.isAlive());
+        assertTrue(failure.get() instanceof BackupException);
+        List<Path> recovery = new ArrayList<>();
+        try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(repo,
+                "*.atomic-rollback")) {
+            for (Path entry : entries) recovery.add(entry);
+        }
+        assertEquals(1, recovery.size());
+        assertArrayEquals(original, Files.readAllBytes(recovery.get(0)));
+        Throwable cancellationFailure = failure.get().getCause();
+        assertTrue(cancellationFailure.getSuppressed()[0].getMessage()
+            .contains(recovery.get(0).toAbsolutePath().normalize().toString()));
+    }
+
+    @Test
     public void failedWritePreservesExistingArchiveAndRemovesTemporaryFiles() throws Exception {
         Path world = temp.newFolder("failed-world").toPath();
         Path source = write(world.resolve("level.dat"), "before");
@@ -963,6 +1007,34 @@ public class ArchiveStoreSecurityTest {
                 throws IOException {
             Files.move(source, target, options);
             moved.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new java.io.InterruptedIOException("interrupted");
+            }
+        }
+
+        @Override public OutputStream newOutputStream(Path path, OpenOption... options)
+                throws IOException {
+            return Files.newOutputStream(path, options);
+        }
+
+        @Override public void beforeFallbackMove(Path source) { }
+    }
+
+    private static final class FailingRollbackAtomicMove
+            implements ArchiveStore.PublishOperations {
+        private final CountDownLatch published = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final java.util.concurrent.atomic.AtomicInteger moves =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override public void move(Path source, Path target, CopyOption... options)
+                throws IOException {
+            if (moves.incrementAndGet() > 1) throw new IOException("rollback move failed");
+            Files.move(source, target, options);
+            published.countDown();
             try {
                 release.await();
             } catch (InterruptedException interrupted) {

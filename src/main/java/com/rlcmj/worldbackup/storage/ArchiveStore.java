@@ -276,17 +276,25 @@ public final class ArchiveStore {
                 () -> publishOperations.move(verifiedArchive, target,
                     StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING),
                 () -> rollbackAtomicPublish(savedTarget, target));
+            cleanupPublishTemp(rollback, null);
+            rollback = null;
         } catch (AtomicMoveNotSupportedException unsupported) {
+            cleanupPublishTemp(rollback, unsupported);
+            rollback = null;
             publishVerifiedWithoutAtomicMove(verifiedArchive, target, verifiedBaseline,
                 cancellation);
-        } finally {
-            cleanupPublishTemp(rollback, null);
         }
     }
 
     private void rollbackAtomicPublish(Path rollback, Path target) throws IOException {
         if (rollback != null) {
-            publishOperations.move(rollback, target, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                publishOperations.move(rollback, target,
+                    StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException failure) {
+                throw new IOException("Failed to restore archive; recovery copy preserved at "
+                    + rollback.toAbsolutePath().normalize(), failure);
+            }
         } else {
             Files.deleteIfExists(target);
         }
