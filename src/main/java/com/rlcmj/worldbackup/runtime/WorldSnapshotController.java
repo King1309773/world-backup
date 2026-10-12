@@ -1,5 +1,6 @@
 package com.rlcmj.worldbackup.runtime;
 
+import com.rlcmj.worldbackup.core.BackupCancellation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.storage.ISaveHandler;
@@ -12,8 +13,11 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
@@ -55,6 +59,26 @@ public final class WorldSnapshotController {
     }
 
     private Handle freezeInitialized(SnapshotServer server) throws Exception {
+        Prepared prepared = prepareInitialized(server);
+        try {
+            return stage(prepared, new BackupCancellation());
+        } catch (Exception failure) {
+            try {
+                releaseWorlds(prepared);
+            } catch (Exception restoreFailure) {
+                failure.addSuppressed(restoreFailure);
+            }
+            throw failure;
+        }
+    }
+
+    public Prepared prepare(MinecraftServer server) throws Exception {
+        MinecraftSnapshotServerFactory factory = new MinecraftSnapshotServerFactory(server);
+        factory.requireServerThread();
+        return prepareInitialized(factory.create());
+    }
+
+    private Prepared prepareInitialized(SnapshotServer server) throws Exception {
         List<SnapshotWorld> worlds = new ArrayList<>(server.worlds());
         server.saveAllWorlds();
         server.saveAllPlayers();
@@ -71,7 +95,6 @@ public final class WorldSnapshotController {
         }
 
         List<WorldState> states = new ArrayList<>();
-        StagedSnapshot staged = null;
         try {
             for (SnapshotWorld world : worlds) {
                 WorldState state = new WorldState(world, world.isSavingDisabled());
@@ -79,16 +102,26 @@ public final class WorldSnapshotController {
                 world.setSavingDisabled(true);
             }
             Path sourceWorld = server.worldDirectory();
-            staged = stager.stage(sourceWorld);
-            return new Handle(server, sourceWorld, staged, states);
+            return new Prepared(server, sourceWorld, states);
         } catch (Exception failure) {
             restoreChangedFlags(states, failure);
-            if (staged != null) {
-                try {
-                    staged.close();
-                } catch (Exception cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
-                }
+            throw failure;
+        }
+    }
+
+    public Handle stage(Prepared prepared, BackupCancellation cancellation)
+            throws Exception {
+        Objects.requireNonNull(prepared, "prepared");
+        Objects.requireNonNull(cancellation, "cancellation").check();
+        StagedSnapshot staged = stager.stage(prepared.sourceWorldDirectory, cancellation);
+        try {
+            cancellation.check();
+            return new Handle(prepared, staged);
+        } catch (Exception failure) {
+            try {
+                staged.close();
+            } catch (Exception cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
             }
             throw failure;
         }
@@ -96,10 +129,10 @@ public final class WorldSnapshotController {
 
     public void unfreeze(Handle handle) throws Exception {
         Objects.requireNonNull(handle, "handle");
-        handle.server.requireServerThread();
+        handle.prepared.server.requireServerThread();
         Exception failure = null;
         try {
-            restoreWorlds(handle);
+            restoreWorlds(handle.prepared);
         } catch (Exception restoreFailure) {
             failure = restoreFailure;
         }
@@ -114,8 +147,14 @@ public final class WorldSnapshotController {
 
     public void releaseWorlds(Handle handle) throws Exception {
         Objects.requireNonNull(handle, "handle");
-        handle.server.requireServerThread();
-        restoreWorlds(handle);
+        handle.prepared.server.requireServerThread();
+        restoreWorlds(handle.prepared);
+    }
+
+    public void releaseWorlds(Prepared prepared) throws Exception {
+        Objects.requireNonNull(prepared, "prepared");
+        prepared.server.requireServerThread();
+        restoreWorlds(prepared);
     }
 
     public void cleanup(Handle handle) throws Exception {
@@ -127,15 +166,15 @@ public final class WorldSnapshotController {
         }
     }
 
-    private static void restoreWorlds(Handle handle) throws Exception {
-        synchronized (handle) {
-            if (handle.worldsReleased) return;
-            restoreWorldFlagsAndSave(handle);
-            handle.worldsReleased = true;
+    private static void restoreWorlds(Prepared prepared) throws Exception {
+        synchronized (prepared) {
+            if (prepared.worldsReleased) return;
+            restoreWorldFlagsAndSave(prepared);
+            prepared.worldsReleased = true;
         }
     }
 
-    private static void restoreWorldFlagsAndSave(Handle handle) throws Exception {
+    private static void restoreWorldFlagsAndSave(Prepared handle) throws Exception {
         Exception failure = null;
         for (WorldState state : handle.states) {
             try {
@@ -167,21 +206,13 @@ public final class WorldSnapshotController {
     }
 
     public static final class Handle {
-        private final SnapshotServer server;
-        private final Path sourceWorldDirectory;
+        private final Prepared prepared;
         private final StagedSnapshot staged;
-        private final List<WorldState> states;
-        private boolean worldsReleased;
         private boolean snapshotClosed;
 
-        private Handle(SnapshotServer server, Path sourceWorldDirectory,
-                       StagedSnapshot staged, List<WorldState> states) {
-            this.server = server;
-            this.sourceWorldDirectory = Objects.requireNonNull(sourceWorldDirectory,
-                "sourceWorldDirectory")
-                .toAbsolutePath().normalize();
+        private Handle(Prepared prepared, StagedSnapshot staged) {
+            this.prepared = Objects.requireNonNull(prepared, "prepared");
             this.staged = Objects.requireNonNull(staged, "staged");
-            this.states = new ArrayList<>(states);
         }
 
         public Path getWorldDirectory() {
@@ -189,12 +220,34 @@ public final class WorldSnapshotController {
         }
 
         public Path getSourceWorldDirectory() {
-            return sourceWorldDirectory;
+            return prepared.sourceWorldDirectory;
+        }
+    }
+
+    public static final class Prepared {
+        private final SnapshotServer server;
+        private final Path sourceWorldDirectory;
+        private final List<WorldState> states;
+        private boolean worldsReleased;
+
+        private Prepared(SnapshotServer server, Path sourceWorldDirectory,
+                         List<WorldState> states) {
+            this.server = Objects.requireNonNull(server, "server");
+            this.sourceWorldDirectory = Objects.requireNonNull(sourceWorldDirectory,
+                "sourceWorldDirectory").toAbsolutePath().normalize();
+            this.states = new ArrayList<>(states);
         }
     }
 
     interface SnapshotStager {
         StagedSnapshot stage(Path source) throws Exception;
+        default StagedSnapshot stage(Path source, BackupCancellation cancellation)
+                throws Exception {
+            cancellation.check();
+            StagedSnapshot result = stage(source);
+            cancellation.check();
+            return result;
+        }
     }
 
     interface StagedSnapshot extends AutoCloseable {
@@ -327,8 +380,18 @@ public final class WorldSnapshotController {
 
         NioSnapshotStager(Path stagingBase) {
             this(stagingBase, store -> store.getUsableSpace(),
-                (source, target) -> Files.copy(source, target,
-                    StandardCopyOption.COPY_ATTRIBUTES, LinkOption.NOFOLLOW_LINKS));
+                new FileCopier() {
+                    @Override public void copy(Path source, Path target)
+                            throws IOException {
+                        copyFile(source, target, new BackupCancellation());
+                    }
+
+                    @Override public void copy(Path source, Path target,
+                                               BackupCancellation cancellation)
+                            throws IOException {
+                        copyFile(source, target, cancellation);
+                    }
+                });
         }
 
         NioSnapshotStager(Path stagingBase, SpaceProbe spaceProbe, FileCopier copier) {
@@ -339,6 +402,13 @@ public final class WorldSnapshotController {
         }
 
         @Override public StagedSnapshot stage(Path source) throws IOException {
+            return stage(source, new BackupCancellation());
+        }
+
+        @Override public StagedSnapshot stage(Path source,
+                                              BackupCancellation cancellation)
+                throws IOException {
+            Objects.requireNonNull(cancellation, "cancellation").check();
             Path absolute = Objects.requireNonNull(source, "source")
                 .toAbsolutePath().normalize();
             if (stagingBase.startsWith(absolute) || absolute.startsWith(stagingBase)) {
@@ -358,7 +428,8 @@ public final class WorldSnapshotController {
                     || resolvedSource.startsWith(resolvedBase)) {
                 throw new IOException("Snapshot staging directory overlaps active world");
             }
-            SnapshotPlan plan = inspectTree(resolvedSource);
+            sweepOrphans(resolvedBase, cancellation);
+            SnapshotPlan plan = inspectTree(resolvedSource, cancellation);
             long bytes = plan.totalBytes;
             long headroom = Math.max(MINIMUM_HEADROOM, bytes / 20L);
             long required = saturatedAdd(bytes, headroom);
@@ -368,7 +439,8 @@ public final class WorldSnapshotController {
             Path staged = Files.createTempDirectory(resolvedBase, "snapshot-")
                 .toAbsolutePath().normalize();
             try {
-                copyTree(resolvedSource, staged, plan, copier);
+                copyTree(resolvedSource, staged, plan, copier, cancellation);
+                cancellation.check();
                 return new NioStagedSnapshot(staged);
             } catch (IOException | RuntimeException failure) {
                 try {
@@ -380,13 +452,16 @@ public final class WorldSnapshotController {
             }
         }
 
-        private static SnapshotPlan inspectTree(Path source) throws IOException {
+        private static SnapshotPlan inspectTree(Path source,
+                                                BackupCancellation cancellation)
+                throws IOException {
             AtomicLong total = new AtomicLong();
             List<SnapshotEntry> directories = new ArrayList<>();
             List<SnapshotEntry> files = new ArrayList<>();
             walkTree(source, new SimpleFileVisitor<Path>() {
                 @Override public FileVisitResult preVisitDirectory(Path directory,
                         BasicFileAttributes attributes) throws IOException {
+                    cancellation.check();
                     requireDirectory(source, directory, attributes);
                     if (!directory.equals(source)) {
                         directories.add(SnapshotEntry.capture(source, directory,
@@ -397,6 +472,7 @@ public final class WorldSnapshotController {
 
                 @Override public FileVisitResult visitFile(Path file,
                         BasicFileAttributes attributes) throws IOException {
+                    cancellation.check();
                     requireRegularFile(source, file, attributes);
                     if (source.relativize(file).toString().equals("session.lock")) {
                         return FileVisitResult.CONTINUE;
@@ -418,22 +494,65 @@ public final class WorldSnapshotController {
         }
 
         private static void copyTree(Path source, Path target, SnapshotPlan plan,
-                                     FileCopier copier)
+                                     FileCopier copier,
+                                     BackupCancellation cancellation)
                 throws IOException {
             for (SnapshotEntry entry : plan.directories) {
+                cancellation.check();
                 Path directory = source.resolve(entry.relative);
                 entry.verifyDirectory(source, directory);
                 Files.createDirectory(target.resolve(entry.relative));
             }
             for (SnapshotEntry entry : plan.files) {
+                cancellation.check();
                 Path file = source.resolve(entry.relative);
                 entry.verifyFile(source, file);
                 Path destination = target.resolve(entry.relative);
-                copier.copy(file, destination);
+                copier.copy(file, destination, cancellation);
+                cancellation.check();
                 entry.verifyFile(source, file);
                 if (!Files.isRegularFile(destination, LinkOption.NOFOLLOW_LINKS)
                         || Files.size(destination) != entry.size) {
                     throw new IOException("Incomplete world snapshot copy: " + file);
+                }
+            }
+        }
+
+        private static void copyFile(Path source, Path target,
+                                     BackupCancellation cancellation)
+                throws IOException {
+            byte[] buffer = new byte[64 * 1024];
+            try (InputStream input = Files.newInputStream(source, StandardOpenOption.READ,
+                    LinkOption.NOFOLLOW_LINKS);
+                 OutputStream output = Files.newOutputStream(target,
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS)) {
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    cancellation.check();
+                    output.write(buffer, 0, count);
+                }
+            }
+            Files.setLastModifiedTime(target, Files.getLastModifiedTime(source,
+                LinkOption.NOFOLLOW_LINKS));
+        }
+
+        private static void sweepOrphans(Path base, BackupCancellation cancellation)
+                throws IOException {
+            try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(base,
+                    "snapshot-*")) {
+                for (Path entry : entries) {
+                    cancellation.check();
+                    BasicFileAttributes attributes = Files.readAttributes(entry,
+                        BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                    Path followed = entry.toRealPath();
+                    Path notFollowed = entry.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                    if (!attributes.isDirectory() || attributes.isSymbolicLink()
+                            || !followed.equals(notFollowed)
+                            || !followed.startsWith(base)) {
+                        continue;
+                    }
+                    deleteTree(entry);
                 }
             }
         }
@@ -539,7 +658,15 @@ public final class WorldSnapshotController {
     }
 
     interface SpaceProbe { long usableSpace(FileStore store) throws IOException; }
-    interface FileCopier { void copy(Path source, Path target) throws IOException; }
+    interface FileCopier {
+        void copy(Path source, Path target) throws IOException;
+        default void copy(Path source, Path target, BackupCancellation cancellation)
+                throws IOException {
+            cancellation.check();
+            copy(source, target);
+            cancellation.check();
+        }
+    }
 
     private static final class NioStagedSnapshot implements StagedSnapshot {
         private final Path root;

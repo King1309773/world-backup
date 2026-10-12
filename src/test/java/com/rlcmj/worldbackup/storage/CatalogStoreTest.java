@@ -25,6 +25,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -34,6 +37,76 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class CatalogStoreTest {
+    @Test
+    public void cancellationDoesNotWaitForBlockedPublishAndRollsItBack() throws Exception {
+        BackupCancellation cancellation = new BackupCancellation();
+        CountDownLatch publishing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean published = new AtomicBoolean();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread thread = new Thread(() -> {
+            try {
+                cancellation.publish(() -> {
+                    published.set(true);
+                    publishing.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("interrupted");
+                    }
+                }, () -> published.set(false));
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "blocked-catalog-publish");
+        thread.start();
+        assertTrue(publishing.await(2, TimeUnit.SECONDS));
+
+        long started = System.nanoTime();
+        cancellation.cancel();
+        long elapsed = System.nanoTime() - started;
+
+        assertTrue("cancel blocked on publish I/O", elapsed < TimeUnit.SECONDS.toNanos(1));
+        release.countDown();
+        thread.join(2000L);
+        assertFalse(thread.isAlive());
+        assertTrue(failure.get() instanceof InterruptedIOException);
+        assertFalse(published.get());
+    }
+
+    @Test
+    public void cancellationDuringBlockedCatalogMoveRestoresPreviousIndex() throws Exception {
+        Path repo = temp.newFolder("blocked-catalog-move").toPath();
+        Path index = repo.resolve("index.json");
+        Files.write(index, "old index".getBytes(StandardCharsets.UTF_8));
+        BackupCancellation cancellation = new BackupCancellation();
+        BlockingFileOperations operations = new BlockingFileOperations();
+        CatalogStore store = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard, operations));
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try {
+                store.save(repo, BackupCatalog.empty("world", "World"), cancellation);
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "blocked-catalog-move");
+        writer.start();
+        assertTrue(operations.moved.await(2, TimeUnit.SECONDS));
+
+        cancellation.cancel();
+        operations.release.countDown();
+        writer.join(2000L);
+
+        assertFalse(writer.isAlive());
+        assertTrue(failure.get() instanceof BackupException);
+        assertEquals("worldbackup.error.cancelled",
+            ((BackupException) failure.get()).getTranslationKey());
+        assertEquals("old index",
+            new String(Files.readAllBytes(index), StandardCharsets.UTF_8));
+    }
+
     @Test
     public void cancelledBackupCannotCrossCatalogPublishGate() throws Exception {
         Path repo = temp.newFolder("cancelled-publish").toPath();
@@ -872,6 +945,33 @@ public class CatalogStoreTest {
                 return Files.deleteIfExists(path);
             }
         };
+    }
+
+    private static final class BlockingFileOperations implements AtomicFiles.FileOperations {
+        private final CountDownLatch moved = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override public void move(Path source, Path target, CopyOption... options)
+                throws IOException {
+            Files.move(source, target, options);
+            moved.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedIOException("interrupted");
+            }
+        }
+
+        @Override public void copy(Path source, Path target, CopyOption... options)
+                throws IOException {
+            Files.copy(source, target, options);
+        }
+
+        @Override public boolean exists(Path path) { return Files.exists(path); }
+        @Override public boolean deleteIfExists(Path path) throws IOException {
+            return Files.deleteIfExists(path);
+        }
     }
 
     private static AtomicFiles.FileOperations atomicMoveUnsupported() {

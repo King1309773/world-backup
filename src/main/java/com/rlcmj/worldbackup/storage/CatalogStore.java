@@ -75,7 +75,20 @@ public final class CatalogStore {
         try {
             atomicWriter.write(repository.resolve(INDEX_NAME),
                 output -> output.write(encoded),
-                publication -> cancellation.publish(publication::run));
+                new AtomicFiles.PublishGuard() {
+                    @Override public void publish(AtomicFiles.IOAction publication)
+                            throws IOException {
+                        cancellation.publish(publication::run);
+                    }
+
+                    @Override public void publish(AtomicFiles.IOAction publication,
+                                                  AtomicFiles.IOAction rollback)
+                            throws IOException {
+                        cancellation.publish(publication::run, rollback::run);
+                    }
+
+                    @Override public boolean supportsRollback() { return true; }
+                });
         } catch (InterruptedIOException failure) {
             throw new BackupException("worldbackup.error.cancelled", failure);
         } catch (IOException failure) {

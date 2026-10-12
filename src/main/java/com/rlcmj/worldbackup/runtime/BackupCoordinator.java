@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,6 +36,7 @@ public final class BackupCoordinator {
 
     private final Runtime runtime;
     private final ExecutorService worker;
+    private final ExecutorService stagingWorker;
     private final Watchdog watchdog;
     private final NanoClock clock;
     private final long timeoutNanos;
@@ -51,6 +53,7 @@ public final class BackupCoordinator {
                       NanoClock clock, long timeoutNanos, long shutdownWaitNanos) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.worker = Objects.requireNonNull(worker, "worker");
+        this.stagingWorker = newDaemonExecutor("World Backup Staging");
         this.watchdog = Objects.requireNonNull(watchdog, "watchdog");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.timeoutNanos = timeoutNanos;
@@ -79,6 +82,7 @@ public final class BackupCoordinator {
             runtime.schedule(server, () -> begin(candidate));
         } catch (Throwable schedulingFailure) {
             candidate.preparationDone.complete(null);
+            candidate.stageDone.complete(null);
             candidate.workerDone.complete(null);
             failBeforeWorker(candidate, schedulingFailure);
         }
@@ -105,6 +109,7 @@ public final class BackupCoordinator {
                 snapshot = current.snapshot;
                 try {
                     waitForCleanup(current);
+                    if (!current.worldsReleased) releaseActiveWorlds(current);
                     if (snapshot != null && current.worldsReleased) {
                         runtime.cleanupSnapshot(snapshot);
                         current.snapshot = null;
@@ -117,10 +122,9 @@ public final class BackupCoordinator {
                     failure = waitFailure;
                     cleanupDeferred = true;
                     deferCleanupAndRelease(current, snapshot);
-                    if (snapshot != null && !current.worldsReleased) {
+                    if (!current.worldsReleased) {
                         try {
-                            runtime.releaseWorlds(snapshot);
-                            current.worldsReleased = true;
+                            releaseActiveWorlds(current);
                         } catch (Throwable releaseFailure) {
                             failure.addSuppressed(releaseFailure);
                         }
@@ -159,6 +163,13 @@ public final class BackupCoordinator {
         }
     }
 
+    private void releaseActiveWorlds(ActiveBackup backup) throws Exception {
+        if (backup.worldsReleased) return;
+        if (backup.snapshot != null) runtime.releaseWorlds(backup.snapshot);
+        else if (backup.prepared != null) runtime.releasePrepared(backup.prepared);
+        backup.worldsReleased = true;
+    }
+
     boolean isActive() {
         return active.get() != null;
     }
@@ -171,13 +182,17 @@ public final class BackupCoordinator {
 
     private void begin(ActiveBackup backup) {
         if (backup.shutdown.get() || backup.terminal.get()) {
+            backup.stageDone.complete(null);
             backup.workerDone.complete(null);
             backup.preparationDone.complete(null);
             return;
         }
         try {
-            backup.snapshot = runtime.freeze(backup.server);
+            backup.prepared = runtime.prepareSnapshot(backup.server);
+            backup.stageTask = stagingWorker.submit(() -> stageSnapshot(backup));
+            backup.snapshot = awaitStaging(backup);
             if (backup.terminal.get()) {
+                releasePreparedWorlds(backup);
                 backup.workerDone.complete(null);
                 return;
             }
@@ -194,10 +209,61 @@ public final class BackupCoordinator {
             }
             backup.workerTask = worker.submit(() -> runWorker(backup));
         } catch (Throwable failure) {
+            releasePreparedWorlds(backup, failure);
             if (backup.workerTask == null) backup.workerDone.complete(null);
-            failBeforeWorker(backup, failure);
+            if (!backup.terminal.get()) failBeforeWorker(backup, failure);
         } finally {
             backup.preparationDone.complete(null);
+        }
+    }
+
+    private void stageSnapshot(ActiveBackup backup) {
+        Object staged = null;
+        backup.stageThread = Thread.currentThread();
+        try {
+            staged = runtime.stageSnapshot(backup.prepared, backup.cancellation);
+            if (!backup.stageResult.complete(staged)) {
+                runtime.cleanupSnapshot(staged);
+            }
+        } catch (Throwable failure) {
+            backup.stageResult.completeExceptionally(failure);
+            if (staged != null) {
+                try {
+                    runtime.cleanupSnapshot(staged);
+                } catch (Throwable cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+        } finally {
+            backup.stageThread = null;
+            backup.stageDone.complete(null);
+        }
+    }
+
+    private Object awaitStaging(ActiveBackup backup) throws Exception {
+        try {
+            return backup.stageResult.get();
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            if (cause instanceof Error) throw (Error) cause;
+            throw new IllegalStateException(cause);
+        } catch (CancellationException failure) {
+            throw new InterruptedException("Snapshot staging cancelled");
+        }
+    }
+
+    private void releasePreparedWorlds(ActiveBackup backup) throws Exception {
+        if (backup.prepared == null || backup.worldsReleased) return;
+        runtime.releasePrepared(backup.prepared);
+        backup.worldsReleased = true;
+    }
+
+    private void releasePreparedWorlds(ActiveBackup backup, Throwable primary) {
+        try {
+            releasePreparedWorlds(backup);
+        } catch (Throwable releaseFailure) {
+            primary.addSuppressed(releaseFailure);
         }
     }
 
@@ -226,11 +292,13 @@ public final class BackupCoordinator {
 
     private void timeout(ActiveBackup backup) {
         if (backup.shutdown.get() || !backup.terminal.compareAndSet(false, true)) return;
+        backup.stageResult.completeExceptionally(new TimeoutException("Snapshot timed out"));
         cancelWorker(backup);
         backup.preparationDone.whenComplete((prepared, preparationFailure) -> {
             if (backup.workerTask == null) backup.workerDone.complete(null);
-            backup.workerDone.whenComplete((ignored, cleanupFailure) ->
-                scheduleFinish(backup, null, null, true));
+            CompletableFuture.allOf(backup.stageDone, backup.workerDone)
+                .whenComplete((ignored, cleanupFailure) ->
+                    scheduleFinish(backup, null, null, true));
         });
     }
 
@@ -240,6 +308,8 @@ public final class BackupCoordinator {
             ActiveBackup.WORKER_PENDING, ActiveBackup.WORKER_CANCELLED);
         Future<?> task = backup.workerTask;
         if (task != null) task.cancel(true);
+        Thread staging = backup.stageThread;
+        if (staging != null) staging.interrupt();
         if (cancelledBeforeStart && task != null) {
             backup.workerDone.complete(null);
         }
@@ -316,26 +386,51 @@ public final class BackupCoordinator {
 
     private void waitForCleanup(ActiveBackup backup)
             throws InterruptedException, ExecutionException, TimeoutException {
-        if (backup.workerTask == null) return;
-        backup.workerDone.get(shutdownWaitNanos, TimeUnit.NANOSECONDS);
+        long deadline = System.nanoTime() + shutdownWaitNanos;
+        backup.stageDone.get(shutdownWaitNanos, TimeUnit.NANOSECONDS);
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0L) throw new TimeoutException("Snapshot cleanup timed out");
+        backup.workerDone.get(remaining, TimeUnit.NANOSECONDS);
     }
 
     private void deferCleanupAndRelease(ActiveBackup backup, Object snapshot) {
-        backup.workerDone.whenComplete((ignored, workerFailure) -> {
-            boolean cleaned = false;
-            try {
-                if (snapshot != null) runtime.cleanupSnapshot(snapshot);
-                cleaned = true;
-            } catch (Throwable cleanupFailure) {
-                runtime.message("worldbackup.message.failure",
-                    secondsSince(backup.startedNanos), errorComponent(cleanupFailure));
-            } finally {
-                if (cleaned) {
+        CompletableFuture.allOf(backup.stageDone, backup.workerDone)
+            .whenComplete((ignored, workerFailure) -> {
+                try {
+                    worker.submit(() -> retryDeferredCleanup(backup, snapshot));
+                } catch (Throwable rejected) {
+                    runtime.message("worldbackup.message.failure",
+                        secondsSince(backup.startedNanos), errorComponent(rejected));
                     backup.finished.set(true);
                     active.compareAndSet(backup, null);
                 }
+            });
+    }
+
+    private void retryDeferredCleanup(ActiveBackup backup, Object snapshot) {
+        Throwable lastFailure = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                if (snapshot != null) runtime.cleanupSnapshot(snapshot);
+                lastFailure = null;
+                break;
+            } catch (Throwable cleanupFailure) {
+                lastFailure = cleanupFailure;
+                if (attempt < 2) {
+                    try {
+                        Thread.sleep(25L * (attempt + 1));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
             }
-        });
+        }
+        if (lastFailure != null) {
+            runtime.message("worldbackup.message.failure",
+                secondsSince(backup.startedNanos), errorComponent(lastFailure));
+        }
+        backup.finished.set(true);
+        active.compareAndSet(backup, null);
     }
 
     private String secondsSince(long startedNanos) {
@@ -390,6 +485,17 @@ public final class BackupCoordinator {
         boolean normalBackupsEnabled(Object server);
         boolean exitBackupEnabled(Object server);
         Object freeze(Object server) throws Exception;
+        default Object prepareSnapshot(Object server) throws Exception {
+            return freeze(server);
+        }
+        default Object stageSnapshot(Object prepared,
+                                     BackupCancellation cancellation) throws Exception {
+            cancellation.check();
+            return prepared;
+        }
+        default void releasePrepared(Object prepared) throws Exception {
+            releaseWorlds(prepared);
+        }
         void unfreeze(Object snapshot) throws Exception;
         default void releaseWorlds(Object snapshot) throws Exception {
             unfreeze(snapshot);
@@ -418,6 +524,8 @@ public final class BackupCoordinator {
         private final BackupCancellation cancellation = new BackupCancellation();
         private final CompletableFuture<BackupResult> result = new CompletableFuture<>();
         private final CompletableFuture<Void> preparationDone = new CompletableFuture<>();
+        private final CompletableFuture<Object> stageResult = new CompletableFuture<>();
+        private final CompletableFuture<Void> stageDone = new CompletableFuture<>();
         private final CompletableFuture<Void> workerDone = new CompletableFuture<>();
         private final AtomicBoolean terminal = new AtomicBoolean();
         private final AtomicInteger workerState = new AtomicInteger(WORKER_PENDING);
@@ -426,8 +534,11 @@ public final class BackupCoordinator {
         private final AtomicBoolean finishRunning = new AtomicBoolean();
         private final AtomicBoolean finishPending = new AtomicBoolean();
         private volatile Object snapshot;
+        private volatile Object prepared;
         private volatile BackupJob job;
         private volatile Future<?> workerTask;
+        private volatile Future<?> stageTask;
+        private volatile Thread stageThread;
         private volatile Cancellable watchdog;
         private volatile Completion completion;
         private volatile boolean worldsReleased;
@@ -490,6 +601,18 @@ public final class BackupCoordinator {
         }
         @Override public Object freeze(Object server) throws Exception {
             return snapshots.freeze((MinecraftServer) server);
+        }
+        @Override public Object prepareSnapshot(Object server) throws Exception {
+            return snapshots.prepare((MinecraftServer) server);
+        }
+        @Override public Object stageSnapshot(Object prepared,
+                                              BackupCancellation cancellation)
+                throws Exception {
+            return snapshots.stage((WorldSnapshotController.Prepared) prepared,
+                cancellation);
+        }
+        @Override public void releasePrepared(Object prepared) throws Exception {
+            snapshots.releaseWorlds((WorldSnapshotController.Prepared) prepared);
         }
         @Override public void unfreeze(Object snapshot) throws Exception {
             snapshots.unfreeze((WorldSnapshotController.Handle) snapshot);

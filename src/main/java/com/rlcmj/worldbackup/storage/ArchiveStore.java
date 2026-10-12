@@ -261,12 +261,34 @@ public final class ArchiveStore {
                                  ArchiveBaseline verifiedBaseline,
                                  BackupCancellation cancellation)
             throws IOException {
+        Path rollback = null;
         try {
-            cancellation.publish(() -> publishOperations.move(verifiedArchive, target,
-                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING));
+            Path parent = target.toAbsolutePath().normalize().getParent();
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                ArchiveBaseline targetBaseline = ArchiveBaseline.capture(target,
+                    cancellation);
+                rollback = copyToUniqueFile(target, targetBaseline, parent,
+                    ".atomic-rollback", cancellation).path;
+                targetBaseline.verify(cancellation);
+            }
+            final Path savedTarget = rollback;
+            cancellation.publish(
+                () -> publishOperations.move(verifiedArchive, target,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING),
+                () -> rollbackAtomicPublish(savedTarget, target));
         } catch (AtomicMoveNotSupportedException unsupported) {
             publishVerifiedWithoutAtomicMove(verifiedArchive, target, verifiedBaseline,
                 cancellation);
+        } finally {
+            cleanupPublishTemp(rollback, null);
+        }
+    }
+
+    private void rollbackAtomicPublish(Path rollback, Path target) throws IOException {
+        if (rollback != null) {
+            publishOperations.move(rollback, target, StandardCopyOption.REPLACE_EXISTING);
+        } else {
+            Files.deleteIfExists(target);
         }
     }
 

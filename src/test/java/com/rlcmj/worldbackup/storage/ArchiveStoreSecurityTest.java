@@ -34,6 +34,9 @@ import java.util.Enumeration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -143,6 +146,75 @@ public class ArchiveStoreSecurityTest {
         try (java.util.stream.Stream<Path> files = Files.list(repo)) {
             assertEquals(0L, files.count());
         }
+    }
+
+    @Test
+    public void cancellationDuringBlockedAtomicPublishRemovesLateArchive() throws Exception {
+        Path world = temp.newFolder("blocked-publish-world").toPath();
+        write(world.resolve("level.dat"), "level");
+        SnapshotManifest snapshot = manifest(world, "level.dat");
+        Path repo = temp.newFolder("blocked-publish-repo").toPath();
+        BackupCancellation cancellation = new BackupCancellation();
+        BlockingAtomicMove operations = new BlockingAtomicMove();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try {
+                new ArchiveStore(operations).write(repo, "late.zip", world, snapshot,
+                    Collections.singletonList("level.dat"), Collections.emptyList(),
+                    cancellation);
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "blocked-archive-publish");
+        writer.start();
+        assertTrue(operations.moved.await(2, TimeUnit.SECONDS));
+
+        cancellation.cancel();
+        operations.release.countDown();
+        writer.join(2000L);
+
+        assertFalse(writer.isAlive());
+        assertTrue(failure.get() instanceof BackupException);
+        assertEquals("worldbackup.error.cancelled",
+            ((BackupException) failure.get()).getTranslationKey());
+        assertFalse(Files.exists(repo.resolve("late.zip")));
+    }
+
+    @Test
+    public void cancellationDuringBlockedAtomicPublishRestoresExistingArchive()
+            throws Exception {
+        Path world = temp.newFolder("blocked-replace-world").toPath();
+        write(world.resolve("level.dat"), "old");
+        Path repo = temp.newFolder("blocked-replace-repo").toPath();
+        ArchiveStore initialStore = new ArchiveStore();
+        initialStore.write(repo, "same.zip", world, manifest(world, "level.dat"),
+            Collections.singletonList("level.dat"), Collections.emptyList(),
+            new BackupCancellation());
+        byte[] original = Files.readAllBytes(repo.resolve("same.zip"));
+        write(world.resolve("level.dat"), "new");
+
+        BackupCancellation cancellation = new BackupCancellation();
+        BlockingAtomicMove operations = new BlockingAtomicMove();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            try {
+                new ArchiveStore(operations).write(repo, "same.zip", world,
+                    manifest(world, "level.dat"), Collections.singletonList("level.dat"),
+                    Collections.emptyList(), cancellation);
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+            }
+        }, "blocked-archive-replace");
+        writer.start();
+        assertTrue(operations.moved.await(2, TimeUnit.SECONDS));
+
+        cancellation.cancel();
+        operations.release.countDown();
+        writer.join(2000L);
+
+        assertFalse(writer.isAlive());
+        assertTrue(failure.get() instanceof BackupException);
+        assertArrayEquals(original, Files.readAllBytes(repo.resolve("same.zip")));
     }
 
     @Test
@@ -881,5 +953,29 @@ public class ArchiveStoreSecurityTest {
                 Files.deleteIfExists(alias);
             }
         }
+    }
+
+    private static final class BlockingAtomicMove implements ArchiveStore.PublishOperations {
+        private final CountDownLatch moved = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override public void move(Path source, Path target, CopyOption... options)
+                throws IOException {
+            Files.move(source, target, options);
+            moved.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new java.io.InterruptedIOException("interrupted");
+            }
+        }
+
+        @Override public OutputStream newOutputStream(Path path, OpenOption... options)
+                throws IOException {
+            return Files.newOutputStream(path, options);
+        }
+
+        @Override public void beforeFallbackMove(Path source) { }
     }
 }

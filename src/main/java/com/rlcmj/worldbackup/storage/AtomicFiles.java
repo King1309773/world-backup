@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AtomicFiles {
     private AtomicFiles() { }
@@ -59,6 +60,12 @@ public final class AtomicFiles {
     @FunctionalInterface
     public interface PublishGuard {
         void publish(IOAction publication) throws IOException;
+
+        default void publish(IOAction publication, IOAction rollback) throws IOException {
+            publish(publication);
+        }
+
+        default boolean supportsRollback() { return false; }
     }
 
     public static void write(Path target, IOConsumer<OutputStream> writer) throws IOException {
@@ -86,6 +93,10 @@ public final class AtomicFiles {
             Files.createDirectories(parent);
         }
         Path temp = target.resolveSibling(target.getFileName().toString() + ".tmp");
+        Path backup = target.resolveSibling(target.getFileName().toString() + ".bak");
+        boolean originalExists = false;
+        boolean publicationPrepared = false;
+        AtomicBoolean rolledBack = new AtomicBoolean();
 
         try {
             try (OutputStream output = Files.newOutputStream(temp, StandardOpenOption.CREATE_NEW,
@@ -93,20 +104,66 @@ public final class AtomicFiles {
                 writer.accept(output);
                 output.flush();
             }
+            if (!publishGuard.supportsRollback()) {
+                publishGuard.publish(() -> {
+                    try {
+                        operations.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                    } catch (AtomicMoveNotSupportedException unsupported) {
+                        replaceNonAtomically(temp, target, operations);
+                    }
+                });
+                return;
+            }
+            if (operations.exists(backup)) throw recoveryArtifactExists(backup);
+            originalExists = operations.exists(target);
+            if (originalExists) operations.copy(target, backup);
+            publicationPrepared = true;
+            final boolean restoreOriginal = originalExists;
             publishGuard.publish(() -> {
                 try {
                     operations.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
                         StandardCopyOption.REPLACE_EXISTING);
                 } catch (AtomicMoveNotSupportedException unsupported) {
-                    replaceNonAtomically(temp, target, operations);
+                    operations.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
                 }
-            });
+            }, () -> rollbackPublication(target, backup, restoreOriginal, rolledBack,
+                operations));
+            if (restoreOriginal) operations.deleteIfExists(backup);
         } catch (IOException | RuntimeException | Error failure) {
+            if (publicationPrepared) {
+                try {
+                    rollbackPublication(target, backup, originalExists, rolledBack, operations);
+                } catch (IOException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+            }
             try {
                 operations.deleteIfExists(temp);
             } catch (IOException cleanupFailure) {
                 failure.addSuppressed(cleanupFailure);
             }
+            throw failure;
+        }
+    }
+
+    private static void rollbackPublication(Path target, Path backup,
+                                            boolean originalExists,
+                                            AtomicBoolean rolledBack,
+                                            FileOperations operations)
+            throws IOException {
+        if (!rolledBack.compareAndSet(false, true)) return;
+        try {
+            if (originalExists) {
+                if (operations.exists(backup)) {
+                    operations.copy(backup, target, StandardCopyOption.REPLACE_EXISTING);
+                    operations.deleteIfExists(backup);
+                }
+            } else {
+                operations.deleteIfExists(target);
+            }
+        } catch (IOException failure) {
+            rolledBack.set(false);
             throw failure;
         }
     }

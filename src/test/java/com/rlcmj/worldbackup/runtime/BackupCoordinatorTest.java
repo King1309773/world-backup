@@ -142,6 +142,50 @@ public class BackupCoordinatorTest {
     }
 
     @Test
+    public void watchdogRestoresWorldWhileUncooperativeStagingWorkerRemainsOwned()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.blockStagingUntilReleased = true;
+        ManualWatchdog watchdog = new ManualWatchdog();
+        BackupCoordinator coordinator = coordinator(runtime, watchdog);
+        Thread requester = new Thread(() ->
+            coordinator.request(new Object(), BackupTrigger.MANUAL), "server-thread");
+        requester.start();
+        assertTrue(runtime.stagingEntered.await(2, TimeUnit.SECONDS));
+
+        watchdog.fire();
+        requester.join(2000L);
+
+        assertFalse("server thread stayed blocked in staging", requester.isAlive());
+        assertEquals(1, runtime.releaseWorldsCount);
+        assertTrue(coordinator.isActive());
+        assertEquals(1L, runtime.backupEntered.getCount());
+
+        runtime.stagingRelease.countDown();
+        await(() -> !coordinator.isActive());
+        assertEquals(1, runtime.cleanupSnapshotCount);
+        assertEquals("worldbackup.error.timeout",
+            runtime.messages.get(runtime.messages.size() - 1));
+    }
+
+    @Test
+    public void watchdogBeforeQueuedPreparationReleasesOwnership() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.deferFirstSchedule = true;
+        ManualWatchdog watchdog = new ManualWatchdog();
+        BackupCoordinator coordinator = coordinator(runtime, watchdog);
+
+        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        watchdog.fire();
+        runtime.runDeferredSchedule();
+
+        await(() -> !coordinator.isActive());
+        assertEquals(0, runtime.freezeCount);
+        assertEquals("worldbackup.error.timeout",
+            runtime.messages.get(runtime.messages.size() - 1));
+    }
+
+    @Test
     public void watchdogIsArmedBeforeSnapshotPreparationStarts() {
         FakeRuntime runtime = new FakeRuntime();
         runtime.failFreeze = true;
@@ -241,6 +285,53 @@ public class BackupCoordinatorTest {
         runtime.backupRelease.countDown();
         await(() -> !coordinator.isActive());
         assertEquals(1, runtime.cleanupSnapshotCount);
+    }
+
+    @Test
+    public void deferredCleanupRetriesThenReleasesOwnership() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.ignoreCancellationUntilReleased = true;
+        runtime.cleanupFailuresRemaining = 1;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.MILLISECONDS.toNanos(30));
+        runtime.coordinator = coordinator;
+        Object server = new Object();
+        coordinator.request(server, BackupTrigger.MANUAL);
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+        coordinator.onServerStopping(server);
+
+        runtime.backupRelease.countDown();
+        await(() -> !coordinator.isActive());
+
+        assertEquals(2, runtime.cleanupSnapshotCount);
+    }
+
+    @Test
+    public void permanentDeferredCleanupFailureEventuallyReleasesOwnership()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.ignoreCancellationUntilReleased = true;
+        runtime.cleanupFailuresRemaining = Integer.MAX_VALUE;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.MILLISECONDS.toNanos(30));
+        runtime.coordinator = coordinator;
+        Object server = new Object();
+        coordinator.request(server, BackupTrigger.MANUAL);
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+        coordinator.onServerStopping(server);
+
+        runtime.backupRelease.countDown();
+        await(() -> !coordinator.isActive());
+
+        assertEquals(3, runtime.cleanupSnapshotCount);
+        assertEquals("worldbackup.message.failure",
+            runtime.messages.get(runtime.messages.size() - 1));
     }
 
     @Test
@@ -415,6 +506,8 @@ public class BackupCoordinatorTest {
         private final List<BackupTrigger> triggers = Collections.synchronizedList(new ArrayList<>());
         private final CountDownLatch backupEntered = new CountDownLatch(1);
         private final CountDownLatch backupRelease = new CountDownLatch(1);
+        private final CountDownLatch stagingEntered = new CountDownLatch(1);
+        private final CountDownLatch stagingRelease = new CountDownLatch(1);
         private volatile boolean blockBackup;
         private volatile boolean blockUntilCancelled;
         private volatile boolean ignoreCancellationUntilReleased;
@@ -424,6 +517,10 @@ public class BackupCoordinatorTest {
         private volatile boolean failBackup;
         private volatile boolean failSecondSchedule;
         private volatile boolean failUnfreezeOnce;
+        private volatile boolean blockStagingUntilReleased;
+        private volatile boolean deferFirstSchedule;
+        private volatile Runnable deferredSchedule;
+        private volatile int cleanupFailuresRemaining;
         private volatile int schedules;
         private volatile int freezeCount;
         private volatile int unfreezeCount;
@@ -439,6 +536,26 @@ public class BackupCoordinatorTest {
             events.add("freeze");
             if (failFreeze) throw new IllegalStateException("freeze failed");
             return new Object();
+        }
+        @Override public Object prepareSnapshot(Object server) {
+            return freeze(server);
+        }
+        @Override public Object stageSnapshot(Object prepared,
+                                              BackupCancellation cancellation) {
+            if (blockStagingUntilReleased) {
+                stagingEntered.countDown();
+                boolean waiting = true;
+                while (waiting) {
+                    try {
+                        stagingRelease.await();
+                        waiting = false;
+                    } catch (InterruptedException ignored) { }
+                }
+            }
+            return prepared;
+        }
+        @Override public void releasePrepared(Object prepared) {
+            releaseWorlds(prepared);
         }
         @Override public void unfreeze(Object snapshot) {
             activeWasClearDuringUnfreeze = !coordinator.isActive();
@@ -456,6 +573,10 @@ public class BackupCoordinatorTest {
         @Override public void cleanupSnapshot(Object snapshot) {
             cleanupSnapshotCount++;
             events.add("cleanup-snapshot");
+            if (cleanupFailuresRemaining > 0) {
+                cleanupFailuresRemaining--;
+                throw new IllegalStateException("cleanup failed");
+            }
         }
         @Override public BackupCoordinator.BackupJob createJob(Object server, Object snapshot,
                                                                 BackupTrigger trigger) {
@@ -493,6 +614,15 @@ public class BackupCoordinatorTest {
         @Override public void schedule(Object server, Runnable command) {
             schedules++;
             if (failSecondSchedule && schedules == 2) throw new IllegalStateException("closed");
+            if (deferFirstSchedule && schedules == 1) {
+                deferredSchedule = command;
+                return;
+            }
+            command.run();
+        }
+        private void runDeferredSchedule() {
+            Runnable command = deferredSchedule;
+            if (command == null) throw new AssertionError("no deferred schedule");
             command.run();
         }
         @Override public void message(String key, Object... arguments) {

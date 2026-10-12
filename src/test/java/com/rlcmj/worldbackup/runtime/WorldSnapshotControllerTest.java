@@ -1,5 +1,6 @@
 package com.rlcmj.worldbackup.runtime;
 
+import com.rlcmj.worldbackup.core.BackupCancellation;
 import org.junit.Test;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
@@ -13,6 +14,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -157,6 +159,70 @@ public class WorldSnapshotControllerTest {
 
         assertThrows(IOException.class, () -> stager.stage(world));
         assertDirectoryEmpty(stagingBase);
+    }
+
+    @Test
+    public void realNioStagingChecksCancellationBetweenCopiedFiles() throws Exception {
+        Path game = temporaryFolder.newFolder("game-copy-cancel").toPath();
+        Path world = Files.createDirectories(game.resolve("saves/world"));
+        Files.write(world.resolve("a.dat"), new byte[] {1});
+        Files.write(world.resolve("b.dat"), new byte[] {2});
+        Path stagingBase = game.resolve(".worldbackup-staging");
+        BackupCancellation cancellation = new BackupCancellation();
+        AtomicInteger copies = new AtomicInteger();
+        WorldSnapshotController.NioSnapshotStager stager =
+            new WorldSnapshotController.NioSnapshotStager(stagingBase,
+                store -> Long.MAX_VALUE, (source, target) -> {
+                    Files.copy(source, target);
+                    if (copies.incrementAndGet() == 1) cancellation.cancel();
+                });
+
+        assertThrows(java.io.InterruptedIOException.class,
+            () -> stager.stage(world, cancellation));
+
+        assertEquals(1, copies.get());
+        assertDirectoryEmpty(stagingBase);
+    }
+
+    @Test
+    public void orphanSweepDeletesOnlyControlledRealDirectories() throws Exception {
+        Path game = temporaryFolder.newFolder("game-orphan-sweep").toPath();
+        Path world = Files.createDirectories(game.resolve("saves/world"));
+        Files.write(world.resolve("level.dat"), new byte[] {1});
+        Path stagingBase = Files.createDirectories(game.resolve(".worldbackup-staging"));
+        Path orphan = Files.createDirectories(stagingBase.resolve("snapshot-orphan"));
+        Files.write(orphan.resolve("partial.dat"), new byte[] {2});
+        Path unrelated = Files.createDirectories(stagingBase.resolve("manual-orphan"));
+        Path matchingFile = Files.write(stagingBase.resolve("snapshot-not-a-directory"),
+            new byte[] {4});
+        Path outside = temporaryFolder.newFolder("outside-orphan-canary").toPath();
+        Path canary = Files.write(outside.resolve("canary.dat"), new byte[] {3});
+        Path link = stagingBase.resolve("snapshot-outside-link");
+        if (System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+                .contains("win")) {
+            Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J",
+                link.toString(), outside.toString()).redirectErrorStream(true).start();
+            Assume.assumeTrue("Junctions are unavailable",
+                process.waitFor() == 0 && Files.exists(link));
+        } else {
+            try {
+                Files.createSymbolicLink(link, outside);
+            } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+                Assume.assumeNoException("Symbolic links are unavailable", unavailable);
+            }
+        }
+
+        WorldSnapshotController.StagedSnapshot staged =
+            new WorldSnapshotController.NioSnapshotStager(stagingBase).stage(world);
+        staged.close();
+
+        assertFalse(Files.exists(orphan));
+        assertTrue(Files.isDirectory(unrelated));
+        assertTrue(Files.isRegularFile(matchingFile));
+        assertTrue(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(canary));
+        assertTrue(Files.exists(world.resolve("level.dat")));
+        Files.delete(link);
     }
 
     @Test
