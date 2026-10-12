@@ -7,6 +7,7 @@ import com.rlcmj.worldbackup.core.BackupTrigger;
 import org.junit.After;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -16,6 +17,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,6 +32,21 @@ public class BackupCoordinatorTest {
     @After
     public void stopExecutors() {
         for (ExecutorService executor : executors) executor.shutdownNow();
+    }
+
+    @Test
+    public void cancelledWatchdogIsRemovedFromSchedulerQueue() throws Exception {
+        ScheduledThreadPoolExecutor scheduler = BackupCoordinator.newWatchdogExecutor();
+        try {
+            Future<?> future = scheduler.schedule(() -> { }, 30L, TimeUnit.MINUTES);
+            assertEquals(1, scheduler.getQueue().size());
+
+            future.cancel(false);
+
+            await(() -> scheduler.getQueue().isEmpty());
+        } finally {
+            scheduler.shutdownNow();
+        }
     }
 
     @Test
@@ -61,6 +78,34 @@ public class BackupCoordinatorTest {
 
         assertEquals("worldbackup.message.success", runtime.messages.get(1));
         assertEquals("3.0", runtime.messageArguments.get(1)[0]);
+    }
+
+    @Test
+    public void workerFailureStillUnfreezesAndCleansSnapshot() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failBackup = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+
+        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        await(() -> !coordinator.isActive() && runtime.messages.size() >= 2);
+
+        assertEquals(1, runtime.unfreezeCount);
+        assertEquals("worldbackup.message.failure", runtime.messages.get(1));
+    }
+
+    @Test
+    public void stagedSnapshotReleasesWorldsBeforeWorkerReadsIt() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+
+        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        await(() -> !coordinator.isActive());
+
+        int release = runtime.events.indexOf("release-worlds");
+        assertTrue(release >= 0);
+        assertTrue(release < runtime.events.indexOf("backup-MANUAL"));
+        assertTrue(runtime.events.indexOf("backup-MANUAL")
+            < runtime.events.indexOf("unfreeze"));
     }
 
     @Test
@@ -97,6 +142,20 @@ public class BackupCoordinatorTest {
     }
 
     @Test
+    public void watchdogIsArmedBeforeSnapshotPreparationStarts() {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failFreeze = true;
+        ManualWatchdog watchdog = new ManualWatchdog(runtime.events);
+        BackupCoordinator coordinator = coordinator(runtime, watchdog);
+
+        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+
+        assertTrue(runtime.events.indexOf("watchdog")
+            < runtime.events.indexOf("freeze"));
+        assertFalse(coordinator.isActive());
+    }
+
+    @Test
     public void watchdogPreventsClaimedWorkerFromWritingAfterUnfreeze() throws Exception {
         FakeRuntime runtime = new FakeRuntime();
         ClaimedWorkerExecutor executor = new ClaimedWorkerExecutor();
@@ -123,13 +182,96 @@ public class BackupCoordinatorTest {
         FakeRuntime runtime = new FakeRuntime();
         runtime.failSecondSchedule = true;
         BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        Object server = new Object();
 
-        coordinator.request(new Object(), BackupTrigger.MANUAL);
-        await(() -> !coordinator.isActive() && runtime.messages.size() >= 2);
+        coordinator.request(server, BackupTrigger.MANUAL);
+        await(() -> runtime.schedules >= 2);
 
+        assertTrue(coordinator.isActive());
+        assertEquals(0, runtime.unfreezeCount);
+
+        await(() -> {
+            coordinator.retryPending(server);
+            return !coordinator.isActive() && runtime.messages.size() >= 2;
+        });
         assertEquals(1, runtime.unfreezeCount);
-        assertEquals(1, runtime.emergencyUnfreezeCount);
-        assertEquals("worldbackup.message.failure", runtime.messages.get(1));
+    }
+
+    @Test
+    public void cleanupFailureRetainsOwnershipUntilServerThreadRetrySucceeds()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failUnfreezeOnce = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        Object server = new Object();
+
+        coordinator.request(server, BackupTrigger.MANUAL);
+        await(() -> runtime.unfreezeCount == 1);
+
+        assertTrue(coordinator.isActive());
+        await(() -> {
+            coordinator.retryPending(server);
+            return !coordinator.isActive();
+        });
+        assertEquals(2, runtime.unfreezeCount);
+        assertEquals("worldbackup.message.failure",
+            runtime.messages.get(runtime.messages.size() - 1));
+    }
+
+    @Test
+    public void shutdownTimeoutReleasesWorldButRetainsOwnershipUntilWorkerEnds()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.ignoreCancellationUntilReleased = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.MILLISECONDS.toNanos(30));
+        runtime.coordinator = coordinator;
+        Object server = new Object();
+        coordinator.request(server, BackupTrigger.MANUAL);
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+
+        coordinator.onServerStopping(server);
+
+        assertTrue(coordinator.isActive());
+        assertEquals(1, runtime.releaseWorldsCount);
+        assertEquals(0, runtime.cleanupSnapshotCount);
+        runtime.backupRelease.countDown();
+        await(() -> !coordinator.isActive());
+        assertEquals(1, runtime.cleanupSnapshotCount);
+    }
+
+    @Test
+    public void interruptedShutdownAlsoDefersSnapshotCleanupUntilWorkerEnds()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.ignoreCancellationUntilReleased = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        runtime.coordinator = coordinator;
+        Object server = new Object();
+        coordinator.request(server, BackupTrigger.MANUAL);
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+
+        Thread.currentThread().interrupt();
+        try {
+            coordinator.onServerStopping(server);
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();
+        }
+
+        assertTrue(coordinator.isActive());
+        assertEquals(1, runtime.releaseWorldsCount);
+        assertEquals(0, runtime.cleanupSnapshotCount);
+        runtime.backupRelease.countDown();
+        await(() -> !coordinator.isActive());
+        assertEquals(1, runtime.cleanupSnapshotCount);
     }
 
     @Test
@@ -144,6 +286,8 @@ public class BackupCoordinatorTest {
         coordinator.onServerStopping(server);
 
         assertEquals(1, runtime.unfreezeCount);
+        assertEquals(2, runtime.freezeCount);
+        assertEquals(1, runtime.cleanupSnapshotCount);
         assertEquals(BackupTrigger.EXIT, runtime.triggers.get(runtime.triggers.size() - 1));
         assertTrue(runtime.events.indexOf("worker-cleaned")
             < runtime.events.indexOf("backup-EXIT"));
@@ -179,8 +323,12 @@ public class BackupCoordinatorTest {
     private interface Check { boolean ok(); }
 
     private static final class ManualWatchdog implements BackupCoordinator.Watchdog {
+        private final List<String> events;
         private Runnable command;
+        private ManualWatchdog() { this(null); }
+        private ManualWatchdog(List<String> events) { this.events = events; }
         @Override public BackupCoordinator.Cancellable schedule(Runnable command, long delay) {
+            if (events != null) events.add("watchdog");
             this.command = command;
             return () -> { };
         }
@@ -269,13 +417,18 @@ public class BackupCoordinatorTest {
         private final CountDownLatch backupRelease = new CountDownLatch(1);
         private volatile boolean blockBackup;
         private volatile boolean blockUntilCancelled;
+        private volatile boolean ignoreCancellationUntilReleased;
         private volatile boolean workerCleaned;
         private volatile boolean backupsEnabled = true;
+        private volatile boolean failFreeze;
+        private volatile boolean failBackup;
         private volatile boolean failSecondSchedule;
+        private volatile boolean failUnfreezeOnce;
         private volatile int schedules;
         private volatile int freezeCount;
         private volatile int unfreezeCount;
-        private volatile int emergencyUnfreezeCount;
+        private volatile int releaseWorldsCount;
+        private volatile int cleanupSnapshotCount;
         private volatile boolean activeWasClearDuringUnfreeze;
         private BackupCoordinator coordinator;
 
@@ -284,16 +437,25 @@ public class BackupCoordinatorTest {
         @Override public Object freeze(Object server) {
             freezeCount++;
             events.add("freeze");
+            if (failFreeze) throw new IllegalStateException("freeze failed");
             return new Object();
         }
         @Override public void unfreeze(Object snapshot) {
             activeWasClearDuringUnfreeze = !coordinator.isActive();
             unfreezeCount++;
             events.add("unfreeze");
+            if (failUnfreezeOnce) {
+                failUnfreezeOnce = false;
+                throw new IllegalStateException("cleanup failed");
+            }
         }
-        @Override public void emergencyUnfreeze(Object snapshot) {
-            emergencyUnfreezeCount++;
-            unfreeze(snapshot);
+        @Override public void releaseWorlds(Object snapshot) {
+            releaseWorldsCount++;
+            events.add("release-worlds");
+        }
+        @Override public void cleanupSnapshot(Object snapshot) {
+            cleanupSnapshotCount++;
+            events.add("cleanup-snapshot");
         }
         @Override public BackupCoordinator.BackupJob createJob(Object server, Object snapshot,
                                                                 BackupTrigger trigger) {
@@ -304,9 +466,19 @@ public class BackupCoordinatorTest {
                                           BackupCancellation cancellation) throws Exception {
             triggers.add(job.trigger);
             events.add("backup-" + job.trigger);
+            if (failBackup) throw new IOException("backup failed");
             if (job.trigger != BackupTrigger.EXIT) {
                 backupEntered.countDown();
                 if (blockBackup) backupRelease.await();
+                if (ignoreCancellationUntilReleased) {
+                    boolean waiting = true;
+                    while (waiting) {
+                        try {
+                            backupRelease.await();
+                            waiting = false;
+                        } catch (InterruptedException ignored) { }
+                    }
+                }
                 if (blockUntilCancelled) {
                     while (!cancellation.isCancelled()) {
                         try { Thread.sleep(5L); }

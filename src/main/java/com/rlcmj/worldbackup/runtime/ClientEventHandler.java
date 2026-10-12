@@ -29,6 +29,7 @@ public final class ClientEventHandler {
         Minecraft minecraft = Minecraft.getMinecraft();
         IntegratedServer server = minecraft.getIntegratedServer();
         boolean loaded = server != null && minecraft.world != null;
+        if (loaded) coordinator.retryPending(server);
         while (manualBackup.isPressed()) {
             if (loaded) coordinator.request(server, BackupTrigger.MANUAL);
         }
@@ -44,6 +45,7 @@ public final class ClientEventHandler {
     static final class BackupTimer {
         private Object serverIdentity;
         private long nextScheduledNanos;
+        private long armedIntervalNanos;
         private boolean armed;
 
         boolean due(Object server, boolean enabled, long intervalNanos, long now) {
@@ -52,8 +54,9 @@ public final class ClientEventHandler {
                 armed = false;
                 return false;
             }
-            if (server != serverIdentity || !armed) {
+            if (server != serverIdentity || !armed || intervalNanos != armedIntervalNanos) {
                 serverIdentity = server;
+                armedIntervalNanos = intervalNanos;
                 nextScheduledNanos = saturatingAdd(now, intervalNanos);
                 armed = true;
                 return false;

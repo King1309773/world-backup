@@ -224,7 +224,7 @@ public class BackupRepositoryTest {
         byte[] originalIndex = Files.readAllBytes(repo.resolve("index.json"));
         List<String> originalFiles = repositoryFiles();
         write("level.dat", "changed");
-        CatalogStore failingStore = new CatalogStore((target, writer) -> {
+        CatalogStore failingStore = new CatalogStore((target, writer, beforePublish) -> {
             throw new IOException("simulated catalog failure");
         });
         BackupRepository failing = repository(Long.MAX_VALUE, new ArchiveStore(), failingStore);
@@ -311,7 +311,7 @@ public class BackupRepositoryTest {
         List<String> originalFiles = repositoryFiles();
         BackupVersion previous = new CatalogStore().load(repo).getVersions().get(0);
         write("level.dat", "changed overwrite");
-        CatalogStore failingStore = new CatalogStore((target, writer) -> {
+        CatalogStore failingStore = new CatalogStore((target, writer, beforePublish) -> {
             throw new IOException("simulated overwrite catalog failure");
         });
 

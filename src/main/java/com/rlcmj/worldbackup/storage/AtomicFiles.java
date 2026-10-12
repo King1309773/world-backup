@@ -51,14 +51,35 @@ public final class AtomicFiles {
         void accept(T value) throws IOException;
     }
 
+    @FunctionalInterface
+    public interface IOAction {
+        void run() throws IOException;
+    }
+
+    @FunctionalInterface
+    public interface PublishGuard {
+        void publish(IOAction publication) throws IOException;
+    }
+
     public static void write(Path target, IOConsumer<OutputStream> writer) throws IOException {
-        write(target, writer, NIO);
+        write(target, writer, publication -> publication.run(), NIO);
+    }
+
+    public static void write(Path target, IOConsumer<OutputStream> writer,
+                             PublishGuard publishGuard) throws IOException {
+        write(target, writer, publishGuard, NIO);
     }
 
     static void write(Path target, IOConsumer<OutputStream> writer,
                       FileOperations operations) throws IOException {
+        write(target, writer, publication -> publication.run(), operations);
+    }
+
+    static void write(Path target, IOConsumer<OutputStream> writer,
+                      PublishGuard publishGuard, FileOperations operations) throws IOException {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(writer, "writer");
+        Objects.requireNonNull(publishGuard, "publishGuard");
         Objects.requireNonNull(operations, "operations");
         Path parent = target.toAbsolutePath().getParent();
         if (parent != null) {
@@ -72,12 +93,14 @@ public final class AtomicFiles {
                 writer.accept(output);
                 output.flush();
             }
-            try {
-                operations.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException unsupported) {
-                replaceNonAtomically(temp, target, operations);
-            }
+            publishGuard.publish(() -> {
+                try {
+                    operations.move(temp, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException unsupported) {
+                    replaceNonAtomically(temp, target, operations);
+                }
+            });
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 operations.deleteIfExists(temp);

@@ -261,10 +261,9 @@ public final class ArchiveStore {
                                  ArchiveBaseline verifiedBaseline,
                                  BackupCancellation cancellation)
             throws IOException {
-        cancellation.check();
         try {
-            publishOperations.move(verifiedArchive, target, StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING);
+            cancellation.publish(() -> publishOperations.move(verifiedArchive, target,
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING));
         } catch (AtomicMoveNotSupportedException unsupported) {
             publishVerifiedWithoutAtomicMove(verifiedArchive, target, verifiedBaseline,
                 cancellation);
@@ -302,8 +301,10 @@ public final class ArchiveStore {
             publish.baseline.verifyMatches(verifiedBaseline.fingerprint, cancellation);
             publishOperations.beforeFallbackMove(publishTemp);
             publish.baseline.verifyMatches(verifiedBaseline.fingerprint, cancellation);
+            final Path readyToPublish = publishTemp;
             moveAttempted = true;
-            publishOperations.move(publishTemp, target, StandardCopyOption.REPLACE_EXISTING);
+            cancellation.publish(() -> publishOperations.move(readyToPublish, target,
+                StandardCopyOption.REPLACE_EXISTING));
             publishTemp = null;
             cancellation.check();
 

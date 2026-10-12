@@ -154,7 +154,7 @@ public final class BackupRepository {
             BackupCatalog candidate = appendCandidate(current, displayName, created);
             RetentionPlanner.Plan retention = retentionPlanner.plan(candidate,
                 maxVisibleVersions);
-            catalogStore.save(repository, retention.getCatalog());
+            catalogStore.save(repository, retention.getCatalog(), cancellation);
             catalogSaved = true;
             cleanupUnreferencedArchives(repository, retention.getCatalog(),
                 retention.getArchiveNamesToDelete());

@@ -12,6 +12,7 @@ import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import com.google.gson.stream.MalformedJsonException;
 import com.rlcmj.worldbackup.core.BackupCatalog;
+import com.rlcmj.worldbackup.core.BackupCancellation;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupMode;
 import com.rlcmj.worldbackup.core.BackupTrigger;
@@ -22,6 +23,7 @@ import com.rlcmj.worldbackup.core.SnapshotManifest;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.io.Reader;
 import java.io.StringReader;
@@ -43,7 +45,8 @@ public final class CatalogStore {
     private final AtomicWriter atomicWriter;
 
     public CatalogStore() {
-        this(AtomicFiles::write);
+        this((target, writer, publishGuard) ->
+            AtomicFiles.write(target, writer, publishGuard));
     }
 
     CatalogStore(AtomicWriter atomicWriter) {
@@ -51,10 +54,17 @@ public final class CatalogStore {
     }
 
     interface AtomicWriter {
-        void write(Path target, AtomicFiles.IOConsumer<OutputStream> writer) throws IOException;
+        void write(Path target, AtomicFiles.IOConsumer<OutputStream> writer,
+                   AtomicFiles.PublishGuard publishGuard) throws IOException;
     }
 
     public void save(Path repository, BackupCatalog catalog) throws BackupException {
+        save(repository, catalog, new BackupCancellation());
+    }
+
+    public void save(Path repository, BackupCatalog catalog,
+                     BackupCancellation cancellation) throws BackupException {
+        Objects.requireNonNull(cancellation, "cancellation");
         validate(catalog);
         final byte[] encoded;
         try {
@@ -63,7 +73,11 @@ public final class CatalogStore {
             throw new BackupException("worldbackup.error.catalog_write", failure);
         }
         try {
-            atomicWriter.write(repository.resolve(INDEX_NAME), output -> output.write(encoded));
+            atomicWriter.write(repository.resolve(INDEX_NAME),
+                output -> output.write(encoded),
+                publication -> cancellation.publish(publication::run));
+        } catch (InterruptedIOException failure) {
+            throw new BackupException("worldbackup.error.cancelled", failure);
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.catalog_write", failure);
         }

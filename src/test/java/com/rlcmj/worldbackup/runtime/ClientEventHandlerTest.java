@@ -37,4 +37,16 @@ public class ClientEventHandlerTest {
         assertFalse(timer.due(server, true, 100L, 550L));
         assertTrue(timer.due(server, true, 100L, 650L));
     }
+
+    @Test
+    public void changingIntervalRearmsFromChangeTime() {
+        ClientEventHandler.BackupTimer timer = new ClientEventHandler.BackupTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, 100L, 0L));
+        assertFalse(timer.due(server, true, 500L, 90L));
+        assertFalse(timer.due(server, true, 500L, 100L));
+        assertFalse(timer.due(server, true, 500L, 589L));
+        assertTrue(timer.due(server, true, 500L, 590L));
+    }
 }

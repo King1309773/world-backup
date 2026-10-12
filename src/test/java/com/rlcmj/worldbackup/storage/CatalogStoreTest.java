@@ -1,7 +1,7 @@
 package com.rlcmj.worldbackup.storage;
 
-import com.rlcmj.worldbackup.core.BackupCancellation;
 import com.rlcmj.worldbackup.core.BackupCatalog;
+import com.rlcmj.worldbackup.core.BackupCancellation;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupResult;
 import com.rlcmj.worldbackup.core.BackupTrigger;
@@ -24,6 +24,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -33,6 +34,23 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class CatalogStoreTest {
+    @Test
+    public void cancelledBackupCannotCrossCatalogPublishGate() throws Exception {
+        Path repo = temp.newFolder("cancelled-publish").toPath();
+        BackupCancellation cancellation = new BackupCancellation();
+        cancellation.cancel();
+        AtomicBoolean published = new AtomicBoolean();
+        CatalogStore store = new CatalogStore((target, writer, publishGuard) -> {
+            publishGuard.publish(() -> published.set(true));
+        });
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> store.save(repo, BackupCatalog.empty("world", "World"), cancellation));
+
+        assertEquals("worldbackup.error.cancelled", failure.getTranslationKey());
+        assertFalse(published.get());
+    }
+
     @Rule
     public TemporaryFolder temp = new TemporaryFolder();
 
@@ -59,8 +77,10 @@ public class CatalogStoreTest {
         Path temporary = repo.resolve("index.json.tmp");
         Files.write(index, "old index".getBytes(StandardCharsets.UTF_8));
         IOException diskFailure = new IOException("simulated mid-write failure");
-        CatalogStore store = new CatalogStore((target, writer) -> AtomicFiles.write(target,
-            output -> writer.accept(failingAfterFourBytes(output, diskFailure))));
+        CatalogStore store = new CatalogStore((target, writer, publishGuard) ->
+            AtomicFiles.write(target,
+                output -> writer.accept(failingAfterFourBytes(output, diskFailure)),
+                publishGuard));
         char[] displayName = new char[20000];
         Arrays.fill(displayName, 'W');
 

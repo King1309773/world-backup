@@ -21,6 +21,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -74,8 +75,11 @@ public final class BackupCoordinator {
         }
         runtime.message("worldbackup.message.start");
         try {
+            candidate.watchdog = watchdog.schedule(() -> timeout(candidate), timeoutNanos);
             runtime.schedule(server, () -> begin(candidate));
         } catch (Throwable schedulingFailure) {
+            candidate.preparationDone.complete(null);
+            candidate.workerDone.complete(null);
             failBeforeWorker(candidate, schedulingFailure);
         }
         return true;
@@ -93,14 +97,37 @@ public final class BackupCoordinator {
         long startedNanos = ownsActive ? current.startedNanos : clock.nanoTime();
         BackupResult exitResult = null;
         Throwable failure = null;
+        boolean cleanupDeferred = false;
         try {
             if (ownsActive) {
                 current.cancelWatchdog();
                 cancelWorker(current);
                 snapshot = current.snapshot;
-                waitForCleanup(current);
+                try {
+                    waitForCleanup(current);
+                    if (snapshot != null && current.worldsReleased) {
+                        runtime.cleanupSnapshot(snapshot);
+                        current.snapshot = null;
+                        snapshot = null;
+                    }
+                } catch (TimeoutException | InterruptedException waitFailure) {
+                    if (waitFailure instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    failure = waitFailure;
+                    cleanupDeferred = true;
+                    deferCleanupAndRelease(current, snapshot);
+                    if (snapshot != null && !current.worldsReleased) {
+                        try {
+                            runtime.releaseWorlds(snapshot);
+                            current.worldsReleased = true;
+                        } catch (Throwable releaseFailure) {
+                            failure.addSuppressed(releaseFailure);
+                        }
+                    }
+                }
             }
-            if (runtime.exitBackupEnabled(server)) {
+            if (!cleanupDeferred && runtime.exitBackupEnabled(server)) {
                 if (snapshot == null) snapshot = runtime.freeze(server);
                 BackupJob job = runtime.createJob(server, snapshot, BackupTrigger.EXIT);
                 exitResult = runtime.run(job, new BackupCancellation());
@@ -108,7 +135,7 @@ public final class BackupCoordinator {
         } catch (Throwable operationFailure) {
             failure = operationFailure;
         } finally {
-            if (snapshot != null) {
+            if (snapshot != null && !cleanupDeferred) {
                 try {
                     runtime.unfreeze(snapshot);
                 } catch (Throwable cleanupFailure) {
@@ -116,7 +143,7 @@ public final class BackupCoordinator {
                     else failure.addSuppressed(cleanupFailure);
                 }
             }
-            if (ownsActive) {
+            if (ownsActive && !cleanupDeferred) {
                 current.finished.set(true);
                 active.compareAndSet(current, null);
             }
@@ -136,16 +163,41 @@ public final class BackupCoordinator {
         return active.get() != null;
     }
 
+    void retryPending(Object server) {
+        ActiveBackup current = active.get();
+        if (current == null || current.server != server || !current.finishPending.get()) return;
+        dispatchFinish(current);
+    }
+
     private void begin(ActiveBackup backup) {
-        if (backup.shutdown.get()) return;
+        if (backup.shutdown.get() || backup.terminal.get()) {
+            backup.workerDone.complete(null);
+            backup.preparationDone.complete(null);
+            return;
+        }
         try {
             backup.snapshot = runtime.freeze(backup.server);
+            if (backup.terminal.get()) {
+                backup.workerDone.complete(null);
+                return;
+            }
             backup.job = runtime.createJob(backup.server, backup.snapshot, backup.trigger);
-            backup.watchdog = watchdog.schedule(() -> timeout(backup), timeoutNanos);
+            if (backup.terminal.get()) {
+                backup.workerDone.complete(null);
+                return;
+            }
+            runtime.releaseWorlds(backup.snapshot);
+            backup.worldsReleased = true;
+            if (backup.terminal.get()) {
+                backup.workerDone.complete(null);
+                return;
+            }
             backup.workerTask = worker.submit(() -> runWorker(backup));
         } catch (Throwable failure) {
             if (backup.workerTask == null) backup.workerDone.complete(null);
             failBeforeWorker(backup, failure);
+        } finally {
+            backup.preparationDone.complete(null);
         }
     }
 
@@ -175,8 +227,11 @@ public final class BackupCoordinator {
     private void timeout(ActiveBackup backup) {
         if (backup.shutdown.get() || !backup.terminal.compareAndSet(false, true)) return;
         cancelWorker(backup);
-        backup.workerDone.whenComplete((ignored, cleanupFailure) ->
-            scheduleFinish(backup, null, null, true));
+        backup.preparationDone.whenComplete((prepared, preparationFailure) -> {
+            if (backup.workerTask == null) backup.workerDone.complete(null);
+            backup.workerDone.whenComplete((ignored, cleanupFailure) ->
+                scheduleFinish(backup, null, null, true));
+        });
     }
 
     private void cancelWorker(ActiveBackup backup) {
@@ -193,49 +248,69 @@ public final class BackupCoordinator {
     private void scheduleFinish(ActiveBackup backup, BackupResult result,
                                 Throwable failure, boolean timedOut) {
         backup.cancelWatchdog();
+        backup.completion = new Completion(result, failure, timedOut);
+        backup.finishPending.set(true);
+        dispatchFinish(backup);
+    }
+
+    private void dispatchFinish(ActiveBackup backup) {
+        if (!backup.finishPending.compareAndSet(true, false)) return;
+        Completion completion = backup.completion;
         try {
             runtime.schedule(backup.server,
-                () -> finish(backup, result, failure, timedOut, false));
+                () -> finish(backup, completion.result, completion.failure,
+                    completion.timedOut));
         } catch (Throwable schedulingFailure) {
-            Throwable reported = failure == null ? schedulingFailure : failure;
-            finish(backup, result, reported, timedOut, true);
+            if (completion.failure == null) completion.failure = schedulingFailure;
+            backup.finishPending.set(true);
         }
     }
 
     private void finish(ActiveBackup backup, BackupResult result,
-                        Throwable failure, boolean timedOut, boolean emergency) {
-        if (!backup.finished.compareAndSet(false, true)) return;
-        backup.cancelWatchdog();
-        Throwable cleanupFailure = null;
-        try {
-            if (backup.snapshot != null) {
-                if (emergency) runtime.emergencyUnfreeze(backup.snapshot);
-                else runtime.unfreeze(backup.snapshot);
-            }
-        } catch (Throwable unfreezeFailure) {
-            cleanupFailure = unfreezeFailure;
-        } finally {
-            active.compareAndSet(backup, null);
+                        Throwable failure, boolean timedOut) {
+        if (backup.finished.get()) return;
+        if (!backup.finishRunning.compareAndSet(false, true)) {
+            backup.finishPending.set(true);
+            return;
         }
-        String elapsed = secondsSince(backup.startedNanos);
-        if (timedOut) {
-            runtime.message("worldbackup.error.timeout", elapsed);
-        } else if (failure != null || cleanupFailure != null) {
-            runtime.message("worldbackup.message.failure", elapsed,
-                errorComponent(failure != null ? failure : cleanupFailure));
-        } else if (result != null && result.isSuccess()) {
-            runtime.message("worldbackup.message.success", elapsed);
-        } else {
-            String key = result == null ? "worldbackup.error.archive_write"
-                : result.getErrorKey();
-            runtime.message("worldbackup.message.failure", elapsed,
-                new TextComponentTranslation(key));
+        backup.cancelWatchdog();
+        try {
+            Completion completion = backup.completion;
+            if (completion == null) {
+                completion = new Completion(result, failure, timedOut);
+                backup.completion = completion;
+            }
+            try {
+                if (backup.snapshot != null) runtime.unfreeze(backup.snapshot);
+            } catch (Throwable cleanupFailure) {
+                if (completion.failure == null) completion.failure = cleanupFailure;
+                backup.finishPending.set(true);
+                return;
+            }
+            if (!backup.finished.compareAndSet(false, true)) return;
+            active.compareAndSet(backup, null);
+            String elapsed = secondsSince(backup.startedNanos);
+            if (completion.timedOut) {
+                runtime.message("worldbackup.error.timeout", elapsed);
+            } else if (completion.failure != null) {
+                runtime.message("worldbackup.message.failure", elapsed,
+                    errorComponent(completion.failure));
+            } else if (completion.result != null && completion.result.isSuccess()) {
+                runtime.message("worldbackup.message.success", elapsed);
+            } else {
+                String key = completion.result == null ? "worldbackup.error.archive_write"
+                    : completion.result.getErrorKey();
+                runtime.message("worldbackup.message.failure", elapsed,
+                    new TextComponentTranslation(key));
+            }
+        } finally {
+            backup.finishRunning.set(false);
         }
     }
 
     private void failBeforeWorker(ActiveBackup backup, Throwable failure) {
         if (backup.terminal.compareAndSet(false, true)) {
-            finish(backup, null, failure, false, false);
+            finish(backup, null, failure, false);
         }
     }
 
@@ -243,6 +318,24 @@ public final class BackupCoordinator {
             throws InterruptedException, ExecutionException, TimeoutException {
         if (backup.workerTask == null) return;
         backup.workerDone.get(shutdownWaitNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void deferCleanupAndRelease(ActiveBackup backup, Object snapshot) {
+        backup.workerDone.whenComplete((ignored, workerFailure) -> {
+            boolean cleaned = false;
+            try {
+                if (snapshot != null) runtime.cleanupSnapshot(snapshot);
+                cleaned = true;
+            } catch (Throwable cleanupFailure) {
+                runtime.message("worldbackup.message.failure",
+                    secondsSince(backup.startedNanos), errorComponent(cleanupFailure));
+            } finally {
+                if (cleaned) {
+                    backup.finished.set(true);
+                    active.compareAndSet(backup, null);
+                }
+            }
+        });
     }
 
     private String secondsSince(long startedNanos) {
@@ -298,9 +391,10 @@ public final class BackupCoordinator {
         boolean exitBackupEnabled(Object server);
         Object freeze(Object server) throws Exception;
         void unfreeze(Object snapshot) throws Exception;
-        default void emergencyUnfreeze(Object snapshot) throws Exception {
+        default void releaseWorlds(Object snapshot) throws Exception {
             unfreeze(snapshot);
         }
+        default void cleanupSnapshot(Object snapshot) throws Exception { }
         BackupJob createJob(Object server, Object snapshot, BackupTrigger trigger)
             throws Exception;
         BackupResult run(BackupJob job, BackupCancellation cancellation) throws Exception;
@@ -323,15 +417,20 @@ public final class BackupCoordinator {
         private final long startedNanos;
         private final BackupCancellation cancellation = new BackupCancellation();
         private final CompletableFuture<BackupResult> result = new CompletableFuture<>();
+        private final CompletableFuture<Void> preparationDone = new CompletableFuture<>();
         private final CompletableFuture<Void> workerDone = new CompletableFuture<>();
         private final AtomicBoolean terminal = new AtomicBoolean();
         private final AtomicInteger workerState = new AtomicInteger(WORKER_PENDING);
         private final AtomicBoolean shutdown = new AtomicBoolean();
         private final AtomicBoolean finished = new AtomicBoolean();
+        private final AtomicBoolean finishRunning = new AtomicBoolean();
+        private final AtomicBoolean finishPending = new AtomicBoolean();
         private volatile Object snapshot;
         private volatile BackupJob job;
         private volatile Future<?> workerTask;
         private volatile Cancellable watchdog;
+        private volatile Completion completion;
+        private volatile boolean worldsReleased;
 
         private ActiveBackup(Object server, BackupTrigger trigger, long startedNanos) {
             this.server = server;
@@ -345,13 +444,20 @@ public final class BackupCoordinator {
         }
     }
 
+    private static final class Completion {
+        private final BackupResult result;
+        private volatile Throwable failure;
+        private final boolean timedOut;
+
+        private Completion(BackupResult result, Throwable failure, boolean timedOut) {
+            this.result = result;
+            this.failure = failure;
+            this.timedOut = timedOut;
+        }
+    }
+
     private static final class ScheduledWatchdog implements Watchdog {
-        private final ScheduledExecutorService scheduler = Executors
-            .newSingleThreadScheduledExecutor(command -> {
-                Thread thread = new Thread(command, "World Backup Watchdog");
-                thread.setDaemon(true);
-                return thread;
-            });
+        private final ScheduledExecutorService scheduler = newWatchdogExecutor();
 
         @Override public Cancellable schedule(Runnable command, long delayNanos) {
             ScheduledFuture<?> future = scheduler.schedule(command, delayNanos,
@@ -360,8 +466,20 @@ public final class BackupCoordinator {
         }
     }
 
+    static ScheduledThreadPoolExecutor newWatchdogExecutor() {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1,
+            command -> {
+                Thread thread = new Thread(command, "World Backup Watchdog");
+                thread.setDaemon(true);
+                return thread;
+            });
+        scheduler.setRemoveOnCancelPolicy(true);
+        return scheduler;
+    }
+
     private static final class MinecraftRuntime implements Runtime {
-        private final WorldSnapshotController snapshots = new WorldSnapshotController();
+        private final WorldSnapshotController snapshots = new WorldSnapshotController(
+            Minecraft.getMinecraft().gameDir.toPath());
         private final BackupRepository repository = new BackupRepository();
 
         @Override public boolean normalBackupsEnabled(Object server) {
@@ -376,17 +494,22 @@ public final class BackupCoordinator {
         @Override public void unfreeze(Object snapshot) throws Exception {
             snapshots.unfreeze((WorldSnapshotController.Handle) snapshot);
         }
-        @Override public void emergencyUnfreeze(Object snapshot) throws Exception {
-            snapshots.emergencyUnfreeze((WorldSnapshotController.Handle) snapshot);
+        @Override public void releaseWorlds(Object snapshot) throws Exception {
+            snapshots.releaseWorlds((WorldSnapshotController.Handle) snapshot);
+        }
+        @Override public void cleanupSnapshot(Object snapshot) throws Exception {
+            snapshots.cleanup((WorldSnapshotController.Handle) snapshot);
         }
         @Override public BackupJob createJob(Object server, Object snapshot,
                                              BackupTrigger trigger) {
             MinecraftServer minecraftServer = (MinecraftServer) server;
-            Path worldRoot = ((WorldSnapshotController.Handle) snapshot)
-                .getWorldDirectory();
+            WorldSnapshotController.Handle handle =
+                (WorldSnapshotController.Handle) snapshot;
+            Path worldRoot = handle.getWorldDirectory();
+            Path sourceWorld = handle.getSourceWorldDirectory();
             ConfigSnapshot config = ConfigSnapshot.capture(
-                Minecraft.getMinecraft().gameDir.toPath(), worldRoot);
-            String worldId = worldRoot.getFileName().toString();
+                Minecraft.getMinecraft().gameDir.toPath(), sourceWorld);
+            String worldId = sourceWorld.getFileName().toString();
             return new BackupJob(worldRoot, config.getBackupRoot().resolve(worldId),
                 worldId, minecraftServer.getWorldName(), config.getMode(), trigger,
                 config.getMaxVersions(), config.getIncrementsPerBase(),
