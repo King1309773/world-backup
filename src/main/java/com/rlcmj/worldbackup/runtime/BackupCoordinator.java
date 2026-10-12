@@ -1,0 +1,408 @@
+package com.rlcmj.worldbackup.runtime;
+
+import com.rlcmj.worldbackup.config.ConfigSnapshot;
+import com.rlcmj.worldbackup.config.WorldBackupConfig;
+import com.rlcmj.worldbackup.core.BackupCancellation;
+import com.rlcmj.worldbackup.core.BackupException;
+import com.rlcmj.worldbackup.core.BackupMode;
+import com.rlcmj.worldbackup.core.BackupResult;
+import com.rlcmj.worldbackup.core.BackupTrigger;
+import com.rlcmj.worldbackup.storage.BackupRepository;
+import net.minecraft.client.Minecraft;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.util.text.TextComponentTranslation;
+
+import java.nio.file.Path;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+public final class BackupCoordinator {
+    private static final long DEFAULT_TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(30);
+    private static final long DEFAULT_SHUTDOWN_WAIT_NANOS = TimeUnit.SECONDS.toNanos(30);
+
+    private final Runtime runtime;
+    private final ExecutorService worker;
+    private final Watchdog watchdog;
+    private final NanoClock clock;
+    private final long timeoutNanos;
+    private final long shutdownWaitNanos;
+    private final AtomicReference<ActiveBackup> active = new AtomicReference<>();
+
+    public BackupCoordinator() {
+        this(new MinecraftRuntime(), newDaemonExecutor("World Backup Worker"),
+            new ScheduledWatchdog(), System::nanoTime, DEFAULT_TIMEOUT_NANOS,
+            DEFAULT_SHUTDOWN_WAIT_NANOS);
+    }
+
+    BackupCoordinator(Runtime runtime, ExecutorService worker, Watchdog watchdog,
+                      NanoClock clock, long timeoutNanos, long shutdownWaitNanos) {
+        this.runtime = Objects.requireNonNull(runtime, "runtime");
+        this.worker = Objects.requireNonNull(worker, "worker");
+        this.watchdog = Objects.requireNonNull(watchdog, "watchdog");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.timeoutNanos = timeoutNanos;
+        this.shutdownWaitNanos = shutdownWaitNanos;
+    }
+
+    public boolean request(MinecraftServer server, BackupTrigger trigger) {
+        return request((Object) server, trigger);
+    }
+
+    boolean request(Object server, BackupTrigger trigger) {
+        Objects.requireNonNull(server, "server");
+        Objects.requireNonNull(trigger, "trigger");
+        if (!runtime.normalBackupsEnabled(server)) {
+            runtime.message("worldbackup.message.disabled");
+            return false;
+        }
+        ActiveBackup candidate = new ActiveBackup(server, trigger, clock.nanoTime());
+        if (!active.compareAndSet(null, candidate)) {
+            runtime.message("worldbackup.message.busy");
+            return false;
+        }
+        runtime.message("worldbackup.message.start");
+        try {
+            runtime.schedule(server, () -> begin(candidate));
+        } catch (Throwable schedulingFailure) {
+            failBeforeWorker(candidate, schedulingFailure);
+        }
+        return true;
+    }
+
+    public void onServerStopping(MinecraftServer server) {
+        onServerStopping((Object) server);
+    }
+
+    void onServerStopping(Object server) {
+        ActiveBackup current = active.get();
+        Object snapshot = null;
+        boolean ownsActive = current != null && current.server == server
+            && current.shutdown.compareAndSet(false, true);
+        long startedNanos = ownsActive ? current.startedNanos : clock.nanoTime();
+        BackupResult exitResult = null;
+        Throwable failure = null;
+        try {
+            if (ownsActive) {
+                current.cancelWatchdog();
+                cancelWorker(current);
+                snapshot = current.snapshot;
+                waitForCleanup(current);
+            }
+            if (runtime.exitBackupEnabled(server)) {
+                if (snapshot == null) snapshot = runtime.freeze(server);
+                BackupJob job = runtime.createJob(server, snapshot, BackupTrigger.EXIT);
+                exitResult = runtime.run(job, new BackupCancellation());
+            }
+        } catch (Throwable operationFailure) {
+            failure = operationFailure;
+        } finally {
+            if (snapshot != null) {
+                try {
+                    runtime.unfreeze(snapshot);
+                } catch (Throwable cleanupFailure) {
+                    if (failure == null) failure = cleanupFailure;
+                    else failure.addSuppressed(cleanupFailure);
+                }
+            }
+            if (ownsActive) {
+                current.finished.set(true);
+                active.compareAndSet(current, null);
+            }
+        }
+        if (failure != null) {
+            runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
+                errorComponent(failure));
+        } else if (exitResult != null && exitResult.isSuccess()) {
+            runtime.message("worldbackup.message.success", secondsSince(startedNanos));
+        } else if (exitResult != null) {
+            runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
+                new TextComponentTranslation(exitResult.getErrorKey()));
+        }
+    }
+
+    boolean isActive() {
+        return active.get() != null;
+    }
+
+    private void begin(ActiveBackup backup) {
+        if (backup.shutdown.get()) return;
+        try {
+            backup.snapshot = runtime.freeze(backup.server);
+            backup.job = runtime.createJob(backup.server, backup.snapshot, backup.trigger);
+            backup.watchdog = watchdog.schedule(() -> timeout(backup), timeoutNanos);
+            backup.workerTask = worker.submit(() -> runWorker(backup));
+        } catch (Throwable failure) {
+            if (backup.workerTask == null) backup.workerDone.complete(null);
+            failBeforeWorker(backup, failure);
+        }
+    }
+
+    private void runWorker(ActiveBackup backup) {
+        if (!backup.workerState.compareAndSet(ActiveBackup.WORKER_PENDING,
+                ActiveBackup.WORKER_RUNNING)) {
+            backup.workerDone.complete(null);
+            return;
+        }
+        try {
+            BackupResult result = runtime.run(backup.job, backup.cancellation);
+            backup.result.complete(result);
+            if (!backup.shutdown.get() && backup.terminal.compareAndSet(false, true)) {
+                scheduleFinish(backup, result, null, false);
+            }
+        } catch (Throwable failure) {
+            backup.result.completeExceptionally(failure);
+            if (!backup.shutdown.get() && backup.terminal.compareAndSet(false, true)) {
+                scheduleFinish(backup, null, failure, false);
+            }
+        } finally {
+            backup.workerState.set(ActiveBackup.WORKER_DONE);
+            backup.workerDone.complete(null);
+        }
+    }
+
+    private void timeout(ActiveBackup backup) {
+        if (backup.shutdown.get() || !backup.terminal.compareAndSet(false, true)) return;
+        cancelWorker(backup);
+        backup.workerDone.whenComplete((ignored, cleanupFailure) ->
+            scheduleFinish(backup, null, null, true));
+    }
+
+    private void cancelWorker(ActiveBackup backup) {
+        backup.cancellation.cancel();
+        boolean cancelledBeforeStart = backup.workerState.compareAndSet(
+            ActiveBackup.WORKER_PENDING, ActiveBackup.WORKER_CANCELLED);
+        Future<?> task = backup.workerTask;
+        if (task != null) task.cancel(true);
+        if (cancelledBeforeStart && task != null) {
+            backup.workerDone.complete(null);
+        }
+    }
+
+    private void scheduleFinish(ActiveBackup backup, BackupResult result,
+                                Throwable failure, boolean timedOut) {
+        backup.cancelWatchdog();
+        try {
+            runtime.schedule(backup.server,
+                () -> finish(backup, result, failure, timedOut, false));
+        } catch (Throwable schedulingFailure) {
+            Throwable reported = failure == null ? schedulingFailure : failure;
+            finish(backup, result, reported, timedOut, true);
+        }
+    }
+
+    private void finish(ActiveBackup backup, BackupResult result,
+                        Throwable failure, boolean timedOut, boolean emergency) {
+        if (!backup.finished.compareAndSet(false, true)) return;
+        backup.cancelWatchdog();
+        Throwable cleanupFailure = null;
+        try {
+            if (backup.snapshot != null) {
+                if (emergency) runtime.emergencyUnfreeze(backup.snapshot);
+                else runtime.unfreeze(backup.snapshot);
+            }
+        } catch (Throwable unfreezeFailure) {
+            cleanupFailure = unfreezeFailure;
+        } finally {
+            active.compareAndSet(backup, null);
+        }
+        String elapsed = secondsSince(backup.startedNanos);
+        if (timedOut) {
+            runtime.message("worldbackup.error.timeout", elapsed);
+        } else if (failure != null || cleanupFailure != null) {
+            runtime.message("worldbackup.message.failure", elapsed,
+                errorComponent(failure != null ? failure : cleanupFailure));
+        } else if (result != null && result.isSuccess()) {
+            runtime.message("worldbackup.message.success", elapsed);
+        } else {
+            String key = result == null ? "worldbackup.error.archive_write"
+                : result.getErrorKey();
+            runtime.message("worldbackup.message.failure", elapsed,
+                new TextComponentTranslation(key));
+        }
+    }
+
+    private void failBeforeWorker(ActiveBackup backup, Throwable failure) {
+        if (backup.terminal.compareAndSet(false, true)) {
+            finish(backup, null, failure, false, false);
+        }
+    }
+
+    private void waitForCleanup(ActiveBackup backup)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        if (backup.workerTask == null) return;
+        backup.workerDone.get(shutdownWaitNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private String secondsSince(long startedNanos) {
+        long elapsed = Math.max(0L, clock.nanoTime() - startedNanos);
+        return String.format(Locale.ROOT, "%.1f", elapsed / 1_000_000_000.0D);
+    }
+
+    private static Object errorComponent(Throwable failure) {
+        if (failure instanceof BackupException) {
+            BackupException backup = (BackupException) failure;
+            return new TextComponentTranslation(backup.getTranslationKey(),
+                backup.getArguments());
+        }
+        return new TextComponentTranslation("worldbackup.error.archive_write");
+    }
+
+    private static ExecutorService newDaemonExecutor(String name) {
+        return Executors.newSingleThreadExecutor(command -> {
+            Thread thread = new Thread(command, name);
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    static final class BackupJob {
+        final Path worldRoot;
+        final Path repository;
+        final String worldId;
+        final String displayName;
+        final BackupMode mode;
+        final BackupTrigger trigger;
+        final int maxVersions;
+        final int incrementsPerBase;
+        final long startedAtMillis;
+
+        BackupJob(Path worldRoot, Path repository, String worldId, String displayName,
+                  BackupMode mode, BackupTrigger trigger, int maxVersions,
+                  int incrementsPerBase, long startedAtMillis) {
+            this.worldRoot = worldRoot;
+            this.repository = repository;
+            this.worldId = worldId;
+            this.displayName = displayName;
+            this.mode = mode;
+            this.trigger = trigger;
+            this.maxVersions = maxVersions;
+            this.incrementsPerBase = incrementsPerBase;
+            this.startedAtMillis = startedAtMillis;
+        }
+    }
+
+    interface Runtime {
+        boolean normalBackupsEnabled(Object server);
+        boolean exitBackupEnabled(Object server);
+        Object freeze(Object server) throws Exception;
+        void unfreeze(Object snapshot) throws Exception;
+        default void emergencyUnfreeze(Object snapshot) throws Exception {
+            unfreeze(snapshot);
+        }
+        BackupJob createJob(Object server, Object snapshot, BackupTrigger trigger)
+            throws Exception;
+        BackupResult run(BackupJob job, BackupCancellation cancellation) throws Exception;
+        void schedule(Object server, Runnable command);
+        void message(String key, Object... arguments);
+    }
+
+    interface NanoClock { long nanoTime(); }
+    interface Cancellable { void cancel(); }
+    interface Watchdog { Cancellable schedule(Runnable command, long delayNanos); }
+
+    private static final class ActiveBackup {
+        private static final int WORKER_PENDING = 0;
+        private static final int WORKER_RUNNING = 1;
+        private static final int WORKER_CANCELLED = 2;
+        private static final int WORKER_DONE = 3;
+
+        private final Object server;
+        private final BackupTrigger trigger;
+        private final long startedNanos;
+        private final BackupCancellation cancellation = new BackupCancellation();
+        private final CompletableFuture<BackupResult> result = new CompletableFuture<>();
+        private final CompletableFuture<Void> workerDone = new CompletableFuture<>();
+        private final AtomicBoolean terminal = new AtomicBoolean();
+        private final AtomicInteger workerState = new AtomicInteger(WORKER_PENDING);
+        private final AtomicBoolean shutdown = new AtomicBoolean();
+        private final AtomicBoolean finished = new AtomicBoolean();
+        private volatile Object snapshot;
+        private volatile BackupJob job;
+        private volatile Future<?> workerTask;
+        private volatile Cancellable watchdog;
+
+        private ActiveBackup(Object server, BackupTrigger trigger, long startedNanos) {
+            this.server = server;
+            this.trigger = trigger;
+            this.startedNanos = startedNanos;
+        }
+
+        private void cancelWatchdog() {
+            Cancellable current = watchdog;
+            if (current != null) current.cancel();
+        }
+    }
+
+    private static final class ScheduledWatchdog implements Watchdog {
+        private final ScheduledExecutorService scheduler = Executors
+            .newSingleThreadScheduledExecutor(command -> {
+                Thread thread = new Thread(command, "World Backup Watchdog");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+        @Override public Cancellable schedule(Runnable command, long delayNanos) {
+            ScheduledFuture<?> future = scheduler.schedule(command, delayNanos,
+                TimeUnit.NANOSECONDS);
+            return () -> future.cancel(false);
+        }
+    }
+
+    private static final class MinecraftRuntime implements Runtime {
+        private final WorldSnapshotController snapshots = new WorldSnapshotController();
+        private final BackupRepository repository = new BackupRepository();
+
+        @Override public boolean normalBackupsEnabled(Object server) {
+            return WorldBackupConfig.enabled;
+        }
+        @Override public boolean exitBackupEnabled(Object server) {
+            return WorldBackupConfig.enabled && WorldBackupConfig.exitEnabled;
+        }
+        @Override public Object freeze(Object server) throws Exception {
+            return snapshots.freeze((MinecraftServer) server);
+        }
+        @Override public void unfreeze(Object snapshot) throws Exception {
+            snapshots.unfreeze((WorldSnapshotController.Handle) snapshot);
+        }
+        @Override public void emergencyUnfreeze(Object snapshot) throws Exception {
+            snapshots.emergencyUnfreeze((WorldSnapshotController.Handle) snapshot);
+        }
+        @Override public BackupJob createJob(Object server, Object snapshot,
+                                             BackupTrigger trigger) {
+            MinecraftServer minecraftServer = (MinecraftServer) server;
+            Path worldRoot = ((WorldSnapshotController.Handle) snapshot)
+                .getWorldDirectory();
+            ConfigSnapshot config = ConfigSnapshot.capture(
+                Minecraft.getMinecraft().gameDir.toPath(), worldRoot);
+            String worldId = worldRoot.getFileName().toString();
+            return new BackupJob(worldRoot, config.getBackupRoot().resolve(worldId),
+                worldId, minecraftServer.getWorldName(), config.getMode(), trigger,
+                config.getMaxVersions(), config.getIncrementsPerBase(),
+                System.currentTimeMillis());
+        }
+        @Override public BackupResult run(BackupJob job, BackupCancellation cancellation)
+                throws Exception {
+            return repository.createBackup(job.worldRoot, job.repository, job.worldId,
+                job.displayName, job.mode, job.trigger, job.maxVersions,
+                job.incrementsPerBase, job.startedAtMillis, cancellation);
+        }
+        @Override public void schedule(Object server, Runnable command) {
+            ((MinecraftServer) server).addScheduledTask(command);
+        }
+        @Override public void message(String key, Object... arguments) {
+            ClientMessages.send(key, arguments);
+        }
+    }
+}
