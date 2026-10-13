@@ -44,28 +44,41 @@ public final class CatalogStore {
     // Bounds recursive parsing so hostile unknown fields cannot exhaust the JVM stack.
     static final int MAX_JSON_DEPTH = 128;
     static final int MAX_INDEX_CHARS = 64 * 1024 * 1024;
+    private static final int CANCELLATION_CHECK_CHARS = 8192;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final AtomicWriter atomicWriter;
     private final int maxIndexChars;
+    private final ParseObserver parseObserver;
 
     public CatalogStore() {
         this((target, writer, publishGuard) ->
-            AtomicFiles.write(target, writer, publishGuard), MAX_INDEX_CHARS);
+            AtomicFiles.write(target, writer, publishGuard), MAX_INDEX_CHARS, null);
     }
 
     CatalogStore(AtomicWriter atomicWriter) {
-        this(atomicWriter, MAX_INDEX_CHARS);
+        this(atomicWriter, MAX_INDEX_CHARS, null);
     }
 
     CatalogStore(AtomicWriter atomicWriter, int maxIndexChars) {
+        this(atomicWriter, maxIndexChars, null);
+    }
+
+    CatalogStore(AtomicWriter atomicWriter, int maxIndexChars,
+                 ParseObserver parseObserver) {
         this.atomicWriter = Objects.requireNonNull(atomicWriter, "atomicWriter");
         if (maxIndexChars < 1) throw new IllegalArgumentException("maxIndexChars");
         this.maxIndexChars = maxIndexChars;
+        this.parseObserver = parseObserver;
     }
 
     interface AtomicWriter {
         void write(Path target, AtomicFiles.IOConsumer<OutputStream> writer,
                    AtomicFiles.PublishGuard publishGuard) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface ParseObserver {
+        void beforeValue() throws IOException;
     }
 
     public void save(Path repository, BackupCatalog catalog) throws BackupException {
@@ -165,12 +178,13 @@ public final class CatalogStore {
             throws IOException {
         String rawJson = readAll(source, cancellation);
         checkCancellation(cancellation);
-        validateRawJsonStrings(rawJson);
+        validateRawJsonStrings(rawJson, cancellation);
         checkCancellation(cancellation);
-        JsonReader reader = new JsonReader(new StringReader(rawJson));
+        JsonReader reader = new JsonReader(new CancellationCheckingReader(
+            new StringReader(rawJson), cancellation));
         reader.setLenient(false);
         try {
-            JsonElement value = readValue(reader, 1);
+            JsonElement value = readValue(reader, 1, cancellation);
             checkCancellation(cancellation);
             if (reader.peek() != JsonToken.END_DOCUMENT) {
                 throw new CatalogSyntaxException("Trailing JSON content");
@@ -236,11 +250,16 @@ public final class CatalogStore {
         private CatalogTooLargeException() { super("Catalog exceeds size limit"); }
     }
 
-    private static void validateRawJsonStrings(String source) {
+    private static void validateRawJsonStrings(String source,
+                                               BackupCancellation cancellation)
+            throws InterruptedIOException {
         boolean inString = false;
         boolean escaped = false;
         int unicodeDigits = 0;
         for (int index = 0; index < source.length(); index++) {
+            if ((index & (CANCELLATION_CHECK_CHARS - 1)) == 0) {
+                checkCancellation(cancellation);
+            }
             char value = source.charAt(index);
             if (!inString) {
                 if (value == '"') {
@@ -297,53 +316,98 @@ public final class CatalogStore {
             || value >= 'A' && value <= 'F';
     }
 
-    private static JsonElement readValue(JsonReader reader, int depth) throws IOException {
+    private JsonElement readValue(JsonReader reader, int depth,
+                                  BackupCancellation cancellation) throws IOException {
+        checkCancellation(cancellation);
+        if (parseObserver != null) parseObserver.beforeValue();
         if (depth > MAX_JSON_DEPTH) {
             throw new CatalogSyntaxException("JSON nesting exceeds " + MAX_JSON_DEPTH);
         }
         JsonToken token = reader.peek();
         switch (token) {
             case BEGIN_OBJECT:
-                return readObject(reader, depth);
+                return readObject(reader, depth, cancellation);
             case BEGIN_ARRAY:
-                return readArray(reader, depth);
+                return readArray(reader, depth, cancellation);
             case STRING:
-                return new JsonPrimitive(reader.nextString());
+                JsonPrimitive string = new JsonPrimitive(reader.nextString());
+                checkCancellation(cancellation);
+                return string;
             case NUMBER:
-                return new JsonPrimitive(new EncodedJsonNumber(reader.nextString()));
+                JsonPrimitive number = new JsonPrimitive(
+                    new EncodedJsonNumber(reader.nextString()));
+                checkCancellation(cancellation);
+                return number;
             case BOOLEAN:
-                return new JsonPrimitive(reader.nextBoolean());
+                JsonPrimitive bool = new JsonPrimitive(reader.nextBoolean());
+                checkCancellation(cancellation);
+                return bool;
             case NULL:
                 reader.nextNull();
+                checkCancellation(cancellation);
                 return JsonNull.INSTANCE;
             default:
                 throw new CatalogSyntaxException("Unexpected JSON token: " + token);
         }
     }
 
-    private static JsonObject readObject(JsonReader reader, int depth) throws IOException {
+    private JsonObject readObject(JsonReader reader, int depth,
+                                  BackupCancellation cancellation) throws IOException {
         JsonObject object = new JsonObject();
         Set<String> names = new HashSet<>();
         reader.beginObject();
         while (reader.hasNext()) {
+            checkCancellation(cancellation);
             String name = reader.nextName();
+            checkCancellation(cancellation);
             if (!names.add(name)) {
                 throw new CatalogSyntaxException("Duplicate JSON field: " + name);
             }
-            object.add(name, readValue(reader, depth + 1));
+            object.add(name, readValue(reader, depth + 1, cancellation));
         }
         reader.endObject();
+        checkCancellation(cancellation);
         return object;
     }
 
-    private static JsonArray readArray(JsonReader reader, int depth) throws IOException {
+    private JsonArray readArray(JsonReader reader, int depth,
+                                BackupCancellation cancellation) throws IOException {
         JsonArray array = new JsonArray();
         reader.beginArray();
         while (reader.hasNext()) {
-            array.add(readValue(reader, depth + 1));
+            checkCancellation(cancellation);
+            array.add(readValue(reader, depth + 1, cancellation));
         }
         reader.endArray();
+        checkCancellation(cancellation);
         return array;
+    }
+
+    private static final class CancellationCheckingReader extends Reader {
+        private final Reader delegate;
+        private final BackupCancellation cancellation;
+        private int uncheckedCharacters;
+
+        private CancellationCheckingReader(Reader delegate,
+                                           BackupCancellation cancellation) {
+            this.delegate = delegate;
+            this.cancellation = cancellation;
+        }
+
+        @Override public int read(char[] buffer, int offset, int length) throws IOException {
+            checkCancellation(cancellation);
+            int count = delegate.read(buffer, offset, length);
+            if (count > 0) {
+                uncheckedCharacters += count;
+                if (uncheckedCharacters >= CANCELLATION_CHECK_CHARS) {
+                    uncheckedCharacters = 0;
+                    checkCancellation(cancellation);
+                }
+            }
+            return count;
+        }
+
+        @Override public void close() throws IOException { delegate.close(); }
     }
 
     private static final class CatalogSyntaxException extends RuntimeException {

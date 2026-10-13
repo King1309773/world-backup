@@ -16,6 +16,7 @@ import org.junit.rules.TemporaryFolder;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
@@ -26,7 +27,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
@@ -95,6 +101,65 @@ public class CatalogStoreTest {
             () -> new CatalogStore().load(repo, cancellation));
 
         assertEquals("worldbackup.error.cancelled", error.getTranslationKey());
+    }
+
+    @Test
+    public void cancellationInsideLargeUnknownArrayReleasesSingleValidator() throws Exception {
+        Path largeRepo = temp.newFolder("cancel-mid-parse").toPath();
+        try (Writer writer = Files.newBufferedWriter(largeRepo.resolve("index.json"),
+                StandardCharsets.UTF_8)) {
+            writer.write("{\"formatVersion\":1,\"worldId\":\"World1\","
+                + "\"displayName\":\"World\",\"versions\":[],\"unknown\":[");
+            for (int index = 0; index < 100_000; index++) {
+                if (index != 0) writer.write(',');
+                writer.write('0');
+            }
+            writer.write("]}");
+        }
+        Path smallRepo = temp.newFolder("after-cancelled-parse").toPath();
+        new CatalogStore().save(smallRepo, BackupCatalog.empty("World1", "World"));
+        BackupCancellation cancellation = new BackupCancellation();
+        CountDownLatch insideArray = new CountDownLatch(1);
+        CountDownLatch continueParsing = new CountDownLatch(1);
+        AtomicInteger values = new AtomicInteger();
+        CatalogStore store = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard), CatalogStore.MAX_INDEX_CHARS,
+            () -> {
+                if (values.incrementAndGet() == 10_000) {
+                    insideArray.countDown();
+                    try {
+                        continueParsing.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("test parser interrupted");
+                    }
+                }
+            });
+        ExecutorService validator = Executors.newSingleThreadExecutor();
+        try {
+            Future<BackupCatalog> cancelled = validator.submit(
+                () -> store.load(largeRepo, cancellation));
+            assertTrue("parser never entered the unknown array",
+                insideArray.await(2, TimeUnit.SECONDS));
+
+            cancellation.cancel();
+            continueParsing.countDown();
+
+            try {
+                cancelled.get(2, TimeUnit.SECONDS);
+                throw new AssertionError("cancelled parse unexpectedly completed");
+            } catch (ExecutionException expected) {
+                assertTrue(expected.getCause() instanceof BackupException);
+                assertEquals("worldbackup.error.cancelled",
+                    ((BackupException) expected.getCause()).getTranslationKey());
+            }
+            assertEquals(BackupCatalog.empty("World1", "World"),
+                validator.submit(() -> new CatalogStore().load(smallRepo))
+                    .get(2, TimeUnit.SECONDS));
+        } finally {
+            continueParsing.countDown();
+            validator.shutdownNow();
+        }
     }
 
     @Test
