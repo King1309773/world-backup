@@ -31,14 +31,19 @@ public final class BackupManagerService {
         this.retention = retention;
     }
 
-    public BackupCatalog load(Path repository) throws BackupException {
-        return catalogs.load(requireRepository(repository));
+    public BackupCatalog load(Path repository, String expectedWorldId)
+            throws BackupException {
+        BackupCatalog catalog = catalogs.load(requireRepository(repository));
+        validateIdentity(catalog, expectedWorldId);
+        return catalog;
     }
 
-    public DeleteResult delete(Path repository, String targetVersionId)
+    public DeleteResult delete(Path repository, String expectedWorldId,
+                               String targetVersionId)
             throws BackupException {
         Path repo = requireRepository(repository);
         BackupCatalog source = catalogs.load(repo);
+        validateIdentity(source, expectedWorldId);
         Set<String> retainedVisible = new LinkedHashSet<>();
         boolean found = false;
         for (BackupVersion version : source.getVersions()) {
@@ -68,6 +73,13 @@ public final class BackupManagerService {
             }
         }
         return new DeleteResult(plan.getCatalog(), warnings);
+    }
+
+    private static void validateIdentity(BackupCatalog catalog, String expectedWorldId)
+            throws BackupException {
+        if (expectedWorldId == null || !expectedWorldId.equals(catalog.getWorldId())) {
+            throw new BackupException("worldbackup.error.catalog_mismatch");
+        }
     }
 
     private static Path requireRepository(Path repository) throws BackupException {

@@ -49,6 +49,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     private int selected = -1;
     private int page;
     private boolean safetyMode;
+    private boolean catalogIdentityValidated;
     private String statusKey;
     private Object[] statusArguments = new Object[0];
 
@@ -85,6 +86,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         page = 0;
         statusKey = null;
         statusArguments = new Object[0];
+        catalogIdentityValidated = false;
         try {
             Path game = mc.gameDir.toPath();
             repository = ConfigSnapshot.capture(game).getBackupRoot().resolve(worldFolder);
@@ -96,7 +98,8 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
                     updateButtons();
                     return;
                 }
-                BackupCatalog catalog = manager.load(repository);
+                BackupCatalog catalog = manager.load(repository, worldFolder);
+                catalogIdentityValidated = true;
                 for (BackupVersion version : catalog.getVersions()) {
                     if (!version.isVisible()) continue;
                     String error = null;
@@ -126,8 +129,11 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
             && mc.getIntegratedServer() == null;
         find(RESTORE).visible = !safetyMode;
         find(RESTORE).enabled = !safetyMode && entry != null && entry.errorKey == null
-            && worldClosed && !coordinator.isBusy();
-        find(DELETE).enabled = selected >= 0 && !coordinator.isBusy();
+            && catalogIdentityValidated && worldClosed && !coordinator.isBusy();
+        find(DELETE).enabled = safetyMode
+            ? selected >= 0 && !coordinator.isBusy()
+            : backupDestructiveEnabled(selected >= 0, catalogIdentityValidated,
+                coordinator.isBusy());
         int pages = pageCount();
         find(PREVIOUS).enabled = page > 0;
         find(NEXT).enabled = page + 1 < pages;
@@ -175,7 +181,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         try {
             if (id == CONFIRM_BACKUP_DELETE && selectedEntry() != null) {
                 BackupManagerService.DeleteResult deleted = manager.delete(repository,
-                    selectedEntry().version.getId());
+                    worldFolder, selectedEntry().version.getId());
                 reload();
                 if (!deleted.getWarnings().isEmpty()) {
                     setStatus("gui.worldbackup.status.delete_warning",
@@ -292,6 +298,11 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         while (size >= 1024D && unit + 1 < units.length) { size /= 1024D; unit++; }
         return unit == 0 ? Long.toString(value) + " " + units[unit]
             : String.format(Locale.ROOT, "%.1f %s", size, units[unit]);
+    }
+    static boolean backupDestructiveEnabled(boolean hasSelection,
+                                            boolean identityValidated,
+                                            boolean busy) {
+        return hasSelection && identityValidated && !busy;
     }
     static String errorKey(Throwable failure) {
         Throwable cursor = failure;

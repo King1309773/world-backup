@@ -12,10 +12,12 @@ import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class BackupManagerServiceTest {
@@ -37,7 +39,7 @@ public class BackupManagerServiceTest {
         new CatalogStore().save(repo, catalog);
 
         BackupManagerService.DeleteResult result =
-            new BackupManagerService().delete(repo, "remove");
+            new BackupManagerService().delete(repo, "World1", "remove");
 
         assertTrue(result.getWarnings().isEmpty());
         BackupCatalog retained = new CatalogStore().load(repo);
@@ -45,6 +47,49 @@ public class BackupManagerServiceTest {
         assertFalse(Files.exists(repo.resolve("remove.zip")));
         assertTrue(Files.exists(repo.resolve("base.zip")));
         assertTrue(Files.exists(repo.resolve("keep.zip")));
+    }
+
+    @Test
+    public void mismatchedCatalogIdentityRejectsLoadAndDeleteWithoutChangingRepository()
+            throws Exception {
+        Path repo = temp.newFolder("mismatched-repo").toPath();
+        BackupCatalog catalog = BackupCatalog.empty("OtherWorld", "Other World");
+        catalog.add(version("remove", BackupMode.FULL, "remove.zip",
+            null, null, true));
+        Path archive = repo.resolve("remove.zip");
+        Files.write(archive, new byte[] { 1, 2, 3 });
+        Path sentinelDirectory = Files.createDirectory(repo.resolve("keep-directory"));
+        Path sentinelFile = Files.write(sentinelDirectory.resolve("keep.dat"),
+            new byte[] { 4 });
+        new CatalogStore().save(repo, catalog);
+        byte[] originalIndex = Files.readAllBytes(repo.resolve("index.json"));
+
+        BackupManagerService service = new BackupManagerService();
+        com.rlcmj.worldbackup.core.BackupException loadFailure = assertThrows(
+            com.rlcmj.worldbackup.core.BackupException.class,
+            () -> service.load(repo, "SelectedWorld"));
+        assertEquals("worldbackup.error.catalog_mismatch",
+            loadFailure.getTranslationKey());
+
+        com.rlcmj.worldbackup.core.BackupException deleteFailure = assertThrows(
+            com.rlcmj.worldbackup.core.BackupException.class,
+            () -> service.delete(repo, "SelectedWorld", "remove"));
+        assertEquals("worldbackup.error.catalog_mismatch",
+            deleteFailure.getTranslationKey());
+        assertTrue(Files.exists(archive));
+        assertTrue(Files.exists(sentinelDirectory));
+        assertTrue(Files.exists(sentinelFile));
+        assertTrue(Arrays.equals(originalIndex,
+            Files.readAllBytes(repo.resolve("index.json"))));
+        assertEquals(catalog, new CatalogStore().load(repo));
+    }
+
+    @Test
+    public void backupDestructiveStateRequiresValidatedCatalogIdentity() {
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(false, true, false));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, false, false));
+        assertTrue(GuiBackupManager.backupDestructiveEnabled(true, true, false));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, true));
     }
 
     private static BackupVersion version(String id, BackupMode mode, String archive,
