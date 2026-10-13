@@ -6,8 +6,10 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -115,5 +117,65 @@ public class SafetyCopyStoreTest {
         assertTrue(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS));
         assertTrue(Files.exists(canary));
         assertTrue(Files.exists(copy));
+    }
+
+    @Test
+    public void rejectsWindowsJunctionBeforeDeletingAnything() throws Exception {
+        org.junit.Assume.assumeTrue(System.getProperty("os.name", "")
+            .toLowerCase(Locale.ROOT).contains("win"));
+        Path game = temp.newFolder("game-junction").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        Path copy = Files.createDirectory(root.resolve("World1-20261009-010203-004"));
+        Path ordinary = Files.write(copy.resolve("a-ordinary.dat"), new byte[] { 1 });
+        Path internalTarget = Files.createDirectory(copy.resolve("junction-target"));
+        Path canary = Files.write(internalTarget.resolve("canary.dat"), new byte[] { 7 });
+        Path junction = copy.resolve("z-junction");
+        Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J",
+            junction.toString(), internalTarget.toString()).redirectErrorStream(true).start();
+        int exit = process.waitFor();
+        org.junit.Assume.assumeTrue("mklink /J unavailable", exit == 0
+            && Files.exists(junction, LinkOption.NOFOLLOW_LINKS));
+
+        assertThrows(BackupException.class, () -> new SafetyCopyStore().delete(
+            game, "World1", copy.getFileName().toString()));
+
+        assertTrue(Files.exists(ordinary));
+        assertTrue(Files.exists(junction, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(canary));
+        assertTrue(Files.exists(copy));
+    }
+
+    @Test
+    public void injectedWindowsReparseFlagRejectsTreeBeforeDeletingAnything()
+            throws Exception {
+        Path game = temp.newFolder("game-injected-reparse").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        Path copy = Files.createDirectory(root.resolve("World1-20261009-010203-004"));
+        Path ordinary = Files.write(copy.resolve("a-ordinary.dat"), new byte[] { 1 });
+        Path reparse = Files.write(copy.resolve("z-reparse.dat"), new byte[] { 2 });
+
+        SafetyCopyStore store = new SafetyCopyStore(
+            path -> path.equals(reparse) ? 0x400 : 0);
+
+        assertThrows(BackupException.class, () -> store.delete(
+            game, "World1", copy.getFileName().toString()));
+        assertTrue(Files.exists(ordinary));
+        assertTrue(Files.exists(reparse));
+        assertTrue(Files.exists(copy));
+    }
+
+    @Test
+    public void unsupportedDosAttributesDoNotRejectOrdinaryTree() throws Exception {
+        Path game = temp.newFolder("game-no-dos-view").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        Path copy = Files.createDirectory(root.resolve("World1-20261009-010203-004"));
+        Files.write(copy.resolve("level.dat"), new byte[] { 1 });
+        SafetyCopyStore store = new SafetyCopyStore(path -> {
+            throw new UnsupportedOperationException("no DOS view");
+        });
+
+        store.delete(game, "World1", copy.getFileName().toString());
+
+        assertFalse(Files.exists(copy));
     }
 }

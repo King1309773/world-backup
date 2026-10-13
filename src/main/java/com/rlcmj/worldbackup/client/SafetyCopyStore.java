@@ -24,9 +24,24 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class SafetyCopyStore {
+    private static final int WINDOWS_REPARSE_POINT = 0x400;
     private static final DateTimeFormatter SAFETY_TIMESTAMP = DateTimeFormatter
         .ofPattern("uuuuMMdd-HHmmss-SSS", Locale.ROOT)
         .withResolverStyle(ResolverStyle.STRICT);
+    private final DosAttributeReader dosAttributes;
+
+    interface DosAttributeReader {
+        Object read(Path path) throws IOException;
+    }
+
+    public SafetyCopyStore() {
+        this(path -> Files.getAttribute(path, "dos:attributes",
+            LinkOption.NOFOLLOW_LINKS));
+    }
+
+    SafetyCopyStore(DosAttributeReader dosAttributes) {
+        this.dosAttributes = dosAttributes;
+    }
 
     public List<Path> list(Path gameDir, String worldId) throws BackupException {
         Path root = root(gameDir);
@@ -70,7 +85,7 @@ public final class SafetyCopyStore {
         }
     }
 
-    private static List<Path> validateTree(Path root, Path target)
+    private List<Path> validateTree(Path root, Path target)
             throws BackupException {
         List<Path> entries = new ArrayList<>();
         try {
@@ -105,11 +120,12 @@ public final class SafetyCopyStore {
         }
     }
 
-    private static void validateEntry(Path entry, BasicFileAttributes attributes,
-                                      Path realRoot, Path realTarget,
-                                      boolean directory) throws IOException {
+    private void validateEntry(Path entry, BasicFileAttributes attributes,
+                               Path realRoot, Path realTarget,
+                               boolean directory) throws IOException {
         Path normalized = entry.toAbsolutePath().normalize();
-        if (!normalized.startsWith(realTarget) || !normalized.startsWith(realRoot)
+        if (isWindowsReparsePoint(entry)
+                || !normalized.startsWith(realTarget) || !normalized.startsWith(realRoot)
                 || Files.isSymbolicLink(entry) || attributes.isOther()
                 || (directory ? !attributes.isDirectory() : !attributes.isRegularFile())) {
             throw new IOException("unsafe safety copy entry");
@@ -117,6 +133,16 @@ public final class SafetyCopyStore {
         Path real = entry.toRealPath();
         if (!real.startsWith(realTarget) || !real.startsWith(realRoot)) {
             throw new IOException("safety copy entry escaped root");
+        }
+    }
+
+    private boolean isWindowsReparsePoint(Path entry) throws IOException {
+        try {
+            Object flags = dosAttributes.read(entry);
+            return flags instanceof Number
+                && (((Number) flags).intValue() & WINDOWS_REPARSE_POINT) != 0;
+        } catch (UnsupportedOperationException unsupported) {
+            return false;
         }
     }
 
