@@ -35,6 +35,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32;
@@ -145,6 +148,68 @@ public class ArchiveStoreSecurityTest {
         assertFalse(Files.exists(repo.resolve("cancelled.zip.tmp")));
         try (java.util.stream.Stream<Path> files = Files.list(repo)) {
             assertEquals(0L, files.count());
+        }
+    }
+
+    @Test
+    public void cancelledManifestValidationStopsBeforeReadingPayload() throws Exception {
+        Path archive = temp.newFile("cancel-read.zip").toPath();
+        BackupCancellation cancellation = new BackupCancellation();
+        cancellation.cancel();
+
+        BackupException error = assertThrows(BackupException.class,
+            () -> new ArchiveStore().readManifest(archive, cancellation));
+
+        assertEquals("worldbackup.error.cancelled", error.getTranslationKey());
+    }
+
+    @Test
+    public void cancelledPayloadValidationReleasesSerializedWorkerForNextTask()
+            throws Exception {
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        BackupCancellation cancellation = new BackupCancellation();
+        CountDownLatch readEntered = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CountDownLatch firstFinished = new CountDownLatch(1);
+        CountDownLatch secondRan = new CountDownLatch(1);
+        InputStream blocked = new InputStream() {
+            @Override public int read() { throw new AssertionError("bulk read required"); }
+            @Override public int read(byte[] bytes, int offset, int length)
+                    throws IOException {
+                readEntered.countDown();
+                try {
+                    while (!releaseRead.await(10, TimeUnit.MILLISECONDS)) {
+                        // Deliberately ignore interruption like a stubborn file-system read.
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.interrupted();
+                    return read(bytes, offset, length);
+                }
+                Arrays.fill(bytes, offset, offset + length, (byte) 7);
+                return length;
+            }
+        };
+        try {
+            Future<?> first = worker.submit(() -> {
+                try {
+                    ArchiveStore.fingerprint(blocked, new byte[8192], cancellation);
+                } catch (IOException expected) {
+                    // Cancellation is the expected terminal result.
+                } finally {
+                    firstFinished.countDown();
+                }
+            });
+            assertTrue(readEntered.await(2, TimeUnit.SECONDS));
+
+            cancellation.cancel();
+            first.cancel(true);
+            releaseRead.countDown();
+            worker.submit(secondRan::countDown);
+
+            assertTrue(firstFinished.await(2, TimeUnit.SECONDS));
+            assertTrue(secondRan.await(2, TimeUnit.SECONDS));
+        } finally {
+            worker.shutdownNow();
         }
     }
 

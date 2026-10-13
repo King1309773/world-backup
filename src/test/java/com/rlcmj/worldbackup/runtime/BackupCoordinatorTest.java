@@ -556,6 +556,79 @@ public class BackupCoordinatorTest {
         assertFalse(coordinator.isRestoreActive());
     }
 
+    @Test
+    public void maintenanceRunsOnWorkerAndExcludesBackupAndRestoreUntilClientCallback()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.deferClientSchedule = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Thread> operationThread = new AtomicReference<>();
+        AtomicReference<Thread> callbackThread = new AtomicReference<>();
+
+        assertTrue(coordinator.requestMaintenance(() -> {
+            operationThread.set(Thread.currentThread());
+            entered.countDown();
+            release.await();
+            return "done";
+        }, new BackupCoordinator.MaintenanceCallback<String>() {
+            @Override public void succeeded(String result) {
+                assertEquals("done", result);
+                callbackThread.set(Thread.currentThread());
+            }
+            @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
+        }));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        assertFalse(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        assertFalse(coordinator.requestRestore(() -> Paths.get("restore"), noRestoreCallback()));
+        assertTrue(coordinator.isBusy());
+        release.countDown();
+        await(() -> runtime.deferredClientSchedule != null);
+        assertTrue(coordinator.isBusy());
+        runtime.runDeferredClientSchedule();
+
+        assertFalse(operationThread.get().equals(callbackThread.get()));
+        assertFalse(coordinator.isBusy());
+    }
+
+    @Test
+    public void maintenanceClientScheduleFailureStaysActiveUntilTickRetry() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failClientSchedule = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        AtomicBoolean callback = new AtomicBoolean();
+
+        assertTrue(coordinator.requestMaintenance(() -> "done",
+            new BackupCoordinator.MaintenanceCallback<String>() {
+                @Override public void succeeded(String result) { callback.set(true); }
+                @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
+            }));
+        await(() -> runtime.clientScheduleAttempts > 0);
+        assertTrue(coordinator.isBusy());
+        assertFalse(callback.get());
+
+        runtime.failClientSchedule = false;
+        coordinator.retryClientCallbacks();
+        assertTrue(callback.get());
+        assertFalse(coordinator.isBusy());
+    }
+
+    private static BackupCoordinator.RestoreCallback noRestoreCallback() {
+        return new BackupCoordinator.RestoreCallback() {
+            @Override public void succeeded(java.nio.file.Path restored) { }
+            @Override public void failed(Throwable failure) { }
+        };
+    }
+
     private BackupCoordinator coordinator(FakeRuntime runtime, ManualWatchdog watchdog) {
         return coordinator(runtime, watchdog, System::nanoTime);
     }
@@ -690,6 +763,8 @@ public class BackupCoordinatorTest {
         private volatile boolean returnFromPrepareWithInterruptSet;
         private volatile boolean failPrepareOnExternalInterrupt;
         private volatile boolean failClientSchedule;
+        private volatile boolean deferClientSchedule;
+        private volatile Runnable deferredClientSchedule;
         private volatile boolean prepareFlagsRestored;
         private volatile Runnable deferredSchedule;
         private volatile int cleanupFailuresRemaining;
@@ -820,6 +895,16 @@ public class BackupCoordinatorTest {
         @Override public void scheduleClient(Runnable command) {
             clientScheduleAttempts++;
             if (failClientSchedule) throw new IllegalStateException("client unavailable");
+            if (deferClientSchedule) {
+                deferredClientSchedule = command;
+                return;
+            }
+            command.run();
+        }
+        private void runDeferredClientSchedule() {
+            Runnable command = deferredClientSchedule;
+            if (command == null) throw new AssertionError("no deferred client callback");
+            deferredClientSchedule = null;
             command.run();
         }
         private void runDeferredSchedule() {

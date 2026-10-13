@@ -41,6 +41,7 @@ public final class CatalogStore {
     private static final String INDEX_NAME = "index.json";
     // Bounds recursive parsing so hostile unknown fields cannot exhaust the JVM stack.
     static final int MAX_JSON_DEPTH = 128;
+    static final int MAX_INDEX_CHARS = 64 * 1024 * 1024;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final AtomicWriter atomicWriter;
 
@@ -97,10 +98,15 @@ public final class CatalogStore {
     }
 
     public BackupCatalog load(Path repository) throws BackupException {
+        return load(repository, null);
+    }
+
+    public BackupCatalog load(Path repository, BackupCancellation cancellation)
+            throws BackupException {
         Path index = repository.resolve(INDEX_NAME);
         try (Reader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
             try {
-                JsonElement json = readDocument(reader);
+                JsonElement json = readDocument(reader, cancellation);
                 readFormatVersion(json);
                 validateStructure(json.getAsJsonObject());
                 BackupCatalog catalog = gson.fromJson(json, BackupCatalog.class);
@@ -115,13 +121,17 @@ public final class CatalogStore {
             }
         } catch (BackupException failure) {
             throw failure;
+        } catch (InterruptedIOException failure) {
+            throw new BackupException("worldbackup.error.cancelled", failure);
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.catalog_read", failure);
         }
     }
 
-    private static JsonElement readDocument(Reader source) throws IOException {
-        String rawJson = readAll(source);
+    private static JsonElement readDocument(Reader source,
+                                            BackupCancellation cancellation)
+            throws IOException {
+        String rawJson = readAll(source, cancellation);
         validateRawJsonStrings(rawJson);
         JsonReader reader = new JsonReader(new StringReader(rawJson));
         reader.setLenient(false);
@@ -137,13 +147,19 @@ public final class CatalogStore {
         }
     }
 
-    private static String readAll(Reader source) throws IOException {
+    private static String readAll(Reader source, BackupCancellation cancellation)
+            throws IOException {
         StringBuilder text = new StringBuilder();
         char[] buffer = new char[4096];
         int count;
         while ((count = source.read(buffer)) != -1) {
+            if (cancellation != null) cancellation.check();
+            if (text.length() > MAX_INDEX_CHARS - count) {
+                throw new CatalogSyntaxException("Catalog exceeds size limit");
+            }
             text.append(buffer, 0, count);
         }
+        if (cancellation != null) cancellation.check();
         return text.toString();
     }
 

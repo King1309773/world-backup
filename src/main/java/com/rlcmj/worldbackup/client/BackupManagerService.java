@@ -3,6 +3,7 @@ package com.rlcmj.worldbackup.client;
 import com.rlcmj.worldbackup.core.BackupCatalog;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupVersion;
+import com.rlcmj.worldbackup.core.BackupCancellation;
 import com.rlcmj.worldbackup.core.PortablePaths;
 import com.rlcmj.worldbackup.storage.CatalogStore;
 import com.rlcmj.worldbackup.storage.RetentionPlanner;
@@ -33,7 +34,14 @@ public final class BackupManagerService {
 
     public BackupCatalog load(Path repository, String expectedWorldId)
             throws BackupException {
-        BackupCatalog catalog = catalogs.load(requireRepository(repository));
+        return load(repository, expectedWorldId, null);
+    }
+
+    public BackupCatalog load(Path repository, String expectedWorldId,
+                              BackupCancellation cancellation) throws BackupException {
+        BackupCatalog catalog = cancellation == null
+            ? catalogs.load(requireRepository(repository))
+            : catalogs.load(requireRepository(repository), cancellation);
         validateIdentity(catalog, expectedWorldId);
         return catalog;
     }

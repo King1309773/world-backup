@@ -38,6 +38,19 @@ import static org.junit.Assert.assertTrue;
 
 public class CatalogStoreTest {
     @Test
+    public void cancelledCatalogLoadStopsBeforeParsing() throws Exception {
+        Path repo = temp.newFolder("cancel-load").toPath();
+        Files.write(repo.resolve("index.json"), "{}".getBytes(StandardCharsets.UTF_8));
+        BackupCancellation cancellation = new BackupCancellation();
+        cancellation.cancel();
+
+        BackupException error = org.junit.Assert.assertThrows(BackupException.class,
+            () -> new CatalogStore().load(repo, cancellation));
+
+        assertEquals("worldbackup.error.cancelled", error.getTranslationKey());
+    }
+
+    @Test
     public void cancellationDoesNotWaitForBlockedPublishAndRollsItBack() throws Exception {
         BackupCancellation cancellation = new BackupCancellation();
         CountDownLatch publishing = new CountDownLatch(1);

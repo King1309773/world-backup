@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
 @SideOnly(Side.CLIENT)
 public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallback {
@@ -54,6 +53,9 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     private final BackupManagerService manager = new BackupManagerService();
     private final BackupRestorer restorer = new BackupRestorer();
     private final SafetyCopyStore safetyStore = new SafetyCopyStore();
+    private final BackupManagerLoadController<LoadResult> loadController =
+        new BackupManagerLoadController<>(VALIDATION_EXECUTOR,
+            command -> { mc.addScheduledTask(command); });
     private final List<Entry> entries = new ArrayList<>();
     private final List<Path> safetyCopies = new ArrayList<>();
     private Path repository;
@@ -62,8 +64,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     private boolean catalogIdentityValidated;
     private String statusKey;
     private Object[] statusArguments = new Object[0];
-    private Future<?> validationTask;
-    private int validationGeneration;
+    private boolean screenActive;
 
     public GuiBackupManager(GuiScreen parent, String worldFolder,
                             BackupCoordinator coordinator) {
@@ -73,6 +74,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
 
     @Override public void initGui() {
+        screenActive = true;
         buttonList.clear();
         boolean compact = width < 432;
         int gap = 4;
@@ -97,15 +99,18 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         int pagerY = compact ? height - 76 : height - 52;
         buttonList.add(new GuiButton(PREVIOUS, width / 2 - 45, pagerY, 40, 20, "<"));
         buttonList.add(new GuiButton(NEXT, width / 2 + 5, pagerY, 40, 20, ">"));
-        reload(repository != null);
+        if (!loadController.isLoaded() && !loadController.isLoading()) {
+            startLoad(repository != null, null, new Object[0]);
+        }
         updateButtons();
     }
 
     public void reload() {
-        reload(false);
+        startLoad(false, null, new Object[0]);
     }
 
-    private void reload(boolean preserveView) {
+    private void startLoad(boolean preserveView, String completedStatus,
+                           Object[] completedArguments) {
         int previousPage = viewState.getPage();
         int previousSelection = viewState.getSelection();
         stopValidation();
@@ -113,82 +118,65 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         safetyCopies.clear();
         viewState.select(preserveView ? previousSelection : -1);
         viewState.setPage(preserveView ? previousPage : 0);
-        statusKey = null;
+        statusKey = "gui.worldbackup.status.loading";
         statusArguments = new Object[0];
         catalogIdentityValidated = false;
-        try {
-            Path game = mc.gameDir.toPath();
-            repository = ConfigSnapshot.capture(game).getBackupRoot().resolve(worldFolder);
-            if (safetyMode) {
-                safetyCopies.addAll(safetyStore.list(game, worldFolder));
-            } else {
-                if (!Files.isRegularFile(repository.resolve("index.json"),
+        final boolean requestedSafetyMode = safetyMode;
+        final Path game = mc.gameDir.toPath();
+        loadController.start(cancellation -> {
+                Path loadedRepository = ConfigSnapshot.capture(game).getBackupRoot()
+                    .resolve(worldFolder);
+                if (requestedSafetyMode) {
+                    return LoadResult.safety(loadedRepository,
+                        safetyStore.list(game, worldFolder));
+                } else if (!Files.isRegularFile(loadedRepository.resolve("index.json"),
                         LinkOption.NOFOLLOW_LINKS)) {
+                    return LoadResult.backups(loadedRepository,
+                        new ArrayList<BackupVersion>(), null);
+                }
+                BackupCatalog catalog = manager.load(loadedRepository, worldFolder,
+                    cancellation);
+                BackupRestorer.AvailabilityReport report =
+                    restorer.validateAvailabilityBatch(loadedRepository, worldFolder,
+                        catalog, cancellation);
+                return LoadResult.backups(loadedRepository, catalog.getVersions(), report);
+            }, new BackupManagerLoadController.Completion<LoadResult>() {
+                @Override public void succeeded(LoadResult result) {
+                    if (!screenActive || requestedSafetyMode != safetyMode) return;
+                    statusKey = completedStatus;
+                    statusArguments = completedArguments;
+                    repository = result.repository;
+                    safetyCopies.addAll(result.safetyCopies);
+                    for (BackupVersion version : result.versions) {
+                        if (!version.isVisible()) continue;
+                        Entry entry = new Entry(version);
+                        entry.validating = false;
+                        entry.errorKey = result.report == null ? null
+                            : result.report.getErrorKey(version.getId());
+                        entries.add(entry);
+                    }
+                    entries.sort(Comparator.comparingLong(
+                        (Entry value) -> value.version.getCreatedAt()).reversed());
+                    catalogIdentityValidated = !requestedSafetyMode;
                     updateButtons();
-                    return;
                 }
-                BackupCatalog catalog = manager.load(repository, worldFolder);
-                catalogIdentityValidated = true;
-                for (BackupVersion version : catalog.getVersions()) {
-                    if (!version.isVisible()) continue;
-                    entries.add(new Entry(version));
+
+                @Override public void failed(Throwable failure) {
+                    if (!screenActive || requestedSafetyMode != safetyMode) return;
+                    statusKey = errorKey(failure);
+                    statusArguments = new Object[0];
+                    updateButtons();
                 }
-                entries.sort(Comparator.comparingLong(
-                    (Entry value) -> value.version.getCreatedAt()).reversed());
-                startValidation(catalog);
-            }
-        } catch (BackupException | IllegalArgumentException failure) {
-            statusKey = errorKey(failure);
-        }
+            });
         updateButtons();
     }
 
-    private void startValidation(BackupCatalog catalog) {
-        stopValidation();
-        final int generation = ++validationGeneration;
-        final Path expectedRepository = repository;
-        validationTask = VALIDATION_EXECUTOR.submit(() -> {
-            BackupRestorer.AvailabilityReport report;
-            try {
-                report = restorer.validateAvailabilityBatch(expectedRepository,
-                    worldFolder, catalog);
-            } catch (BackupException failure) {
-                final String error = failure.getTranslationKey();
-                scheduleValidationResult(generation, expectedRepository, null, error);
-                return;
-            }
-            scheduleValidationResult(generation, expectedRepository, report, null);
-        });
-    }
-
-    private void scheduleValidationResult(int generation, Path expectedRepository,
-                                          BackupRestorer.AvailabilityReport report,
-                                          String batchError) {
-        try {
-            mc.addScheduledTask(() -> {
-                if (generation != validationGeneration
-                        || !expectedRepository.equals(repository)) return;
-                for (Entry entry : entries) {
-                    entry.validating = false;
-                    entry.errorKey = batchError != null ? batchError
-                        : report.getErrorKey(entry.version.getId());
-                }
-                updateButtons();
-            });
-        } catch (RuntimeException ignored) {
-            // A closing client owns no safe UI thread; the generation remains stale.
-        }
-    }
-
     private void stopValidation() {
-        validationGeneration++;
-        if (validationTask != null) {
-            validationTask.cancel(true);
-            validationTask = null;
-        }
+        loadController.cancel();
     }
 
     @Override public void onGuiClosed() {
+        screenActive = false;
         stopValidation();
         super.onGuiClosed();
     }
@@ -205,11 +193,13 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         find(RESTORE).visible = !safetyMode;
         find(RESTORE).enabled = !safetyMode && entry != null && !entry.validating
             && entry.errorKey == null
-            && catalogIdentityValidated && worldClosed && !coordinator.isBusy();
+            && loadController.isLoaded() && catalogIdentityValidated
+            && worldClosed && !coordinator.isBusy();
         find(DELETE).enabled = safetyMode
-            ? viewState.getSelection() >= 0 && !coordinator.isBusy()
-            : backupDestructiveEnabled(viewState.getSelection() >= 0, catalogIdentityValidated,
-                coordinator.isBusy());
+            ? loadController.isLoaded() && viewState.getSelection() >= 0
+                && !coordinator.isBusy()
+            : backupDestructiveEnabled(viewState.getSelection() >= 0,
+                catalogIdentityValidated, coordinator.isBusy(), loadController.isLoaded());
         find(DONE).enabled = !coordinator.isRestoreActive();
         int pages = pageCount();
         find(PREVIOUS).enabled = viewState.getPage() > 0;
@@ -226,6 +216,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         if (button.id == DONE) mc.displayGuiScreen(parent);
         else if (button.id == SAFETY) {
             safetyMode = !safetyMode;
+            loadController.cancel();
             initGui();
         } else if (button.id == PREVIOUS) {
             viewState.setPage(viewState.getPage() - 1);
@@ -252,25 +243,61 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
 
     @Override public void confirmClicked(boolean result, int id) {
+        Entry confirmedEntry = selectedEntry();
+        Path confirmedRepository = repository;
+        String confirmedSafetyCopy = id == CONFIRM_SAFETY_DELETE
+            && viewState.getSelection() >= 0
+            && viewState.getSelection() < safetyCopies.size()
+                ? safetyCopies.get(viewState.getSelection()).getFileName().toString()
+                : null;
         mc.displayGuiScreen(this);
         if (!result || coordinator.isBusy()) return;
-        try {
-            if (id == CONFIRM_BACKUP_DELETE && selectedEntry() != null) {
-                BackupManagerService.DeleteResult deleted = manager.delete(repository,
-                    worldFolder, selectedEntry().version.getId());
-                reload();
-                if (!deleted.getWarnings().isEmpty()) {
-                    setStatus("gui.worldbackup.status.delete_warning",
-                        deleted.getWarnings().size());
-                }
-            } else if (id == CONFIRM_SAFETY_DELETE && viewState.getSelection() >= 0) {
-                safetyStore.delete(mc.gameDir.toPath(), worldFolder,
-                    safetyCopies.get(viewState.getSelection()).getFileName().toString());
-                reload();
+        if (id == CONFIRM_BACKUP_DELETE && confirmedEntry != null) {
+            final String versionId = confirmedEntry.version.getId();
+            final Path deleteRepository = confirmedRepository;
+            beginMaintenance();
+            if (!coordinator.requestMaintenance(() -> manager.delete(deleteRepository,
+                    worldFolder, versionId), deleteCallback())) {
+                startLoad(false, "worldbackup.message.busy", new Object[0]);
             }
-        } catch (BackupException failure) {
-            setStatus(failure.getTranslationKey());
+        } else if (id == CONFIRM_SAFETY_DELETE && confirmedSafetyCopy != null) {
+            final Path game = mc.gameDir.toPath();
+            final String copyName = confirmedSafetyCopy;
+            beginMaintenance();
+            if (!coordinator.requestMaintenance(() -> {
+                safetyStore.delete(game, worldFolder, copyName);
+                return new Object();
+            }, deleteCallback())) {
+                startLoad(false, "worldbackup.message.busy", new Object[0]);
+            }
         }
+    }
+
+    private void beginMaintenance() {
+        stopValidation();
+        setStatus("gui.worldbackup.status.deleting");
+        updateButtons();
+    }
+
+    private BackupCoordinator.MaintenanceCallback<Object> deleteCallback() {
+        return new BackupCoordinator.MaintenanceCallback<Object>() {
+            @Override public void succeeded(Object value) {
+                if (!screenActive) return;
+                if (value instanceof BackupManagerService.DeleteResult
+                        && !((BackupManagerService.DeleteResult) value).getWarnings().isEmpty()) {
+                    startLoad(false, "gui.worldbackup.status.delete_warning",
+                        new Object[] { ((BackupManagerService.DeleteResult) value)
+                            .getWarnings().size() });
+                } else {
+                    startLoad(false, "gui.worldbackup.status.delete_success", new Object[0]);
+                }
+            }
+            @Override public void failed(Throwable failure) {
+                if (!screenActive) return;
+                setStatus(errorKey(failure));
+                updateButtons();
+            }
+        };
     }
 
     void beginRestore() {
@@ -280,13 +307,12 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
 
     void restoreSucceeded() {
         mc.getSaveLoader().flushCache();
-        reload();
-        setStatus("worldbackup.message.restore_success");
+        startLoad(false, "worldbackup.message.restore_success", new Object[0]);
     }
 
     void restoreFailed(Throwable failure) {
-        setStatus("worldbackup.message.restore_failure",
-            I18n.format(errorKey(failure)));
+        startLoad(true, "worldbackup.message.restore_failure",
+            new Object[] { I18n.format(errorKey(failure)) });
     }
 
     void setStatus(String key, Object... arguments) {
@@ -397,8 +423,8 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
     static boolean backupDestructiveEnabled(boolean hasSelection,
                                             boolean identityValidated,
-                                            boolean busy) {
-        return hasSelection && identityValidated && !busy;
+                                            boolean busy, boolean loaded) {
+        return loaded && hasSelection && identityValidated && !busy;
     }
     static String errorKey(Throwable failure) {
         Throwable cursor = failure;
@@ -416,6 +442,30 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
         private boolean validating = true;
         private Entry(BackupVersion version) {
             this.version = version;
+        }
+    }
+
+    private static final class LoadResult {
+        private final Path repository;
+        private final List<BackupVersion> versions;
+        private final List<Path> safetyCopies;
+        private final BackupRestorer.AvailabilityReport report;
+        private LoadResult(Path repository, List<BackupVersion> versions,
+                           List<Path> safetyCopies,
+                           BackupRestorer.AvailabilityReport report) {
+            this.repository = repository;
+            this.versions = versions;
+            this.safetyCopies = safetyCopies;
+            this.report = report;
+        }
+        private static LoadResult backups(Path repository, List<BackupVersion> versions,
+                                          BackupRestorer.AvailabilityReport report) {
+            return new LoadResult(repository, new ArrayList<>(versions),
+                new ArrayList<Path>(), report);
+        }
+        private static LoadResult safety(Path repository, List<Path> copies) {
+            return new LoadResult(repository, new ArrayList<BackupVersion>(),
+                new ArrayList<>(copies), null);
         }
     }
 }

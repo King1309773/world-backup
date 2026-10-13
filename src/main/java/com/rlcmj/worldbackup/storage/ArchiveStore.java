@@ -146,14 +146,43 @@ public final class ArchiveStore {
     }
 
     public SnapshotManifest readManifest(Path archive) throws BackupException {
+        return readManifest(archive, null);
+    }
+
+    public SnapshotManifest readManifest(Path archive, BackupCancellation cancellation)
+            throws BackupException {
+        return readDescription(archive, cancellation).getSnapshot();
+    }
+
+    public ArchiveDescription readDescription(Path archive,
+                                              BackupCancellation cancellation)
+            throws BackupException {
         Objects.requireNonNull(archive, "archive");
-        try (ValidatedArchive validated = openValidatedArchive(archive, null)) {
-            return validated.metadata.snapshot;
+        try (ValidatedArchive validated = openValidatedArchive(archive, cancellation)) {
+            return new ArchiveDescription(validated.metadata.snapshot,
+                validated.metadata.included, validated.metadata.deleted);
+        } catch (InterruptedIOException failure) {
+            throw new BackupException("worldbackup.error.cancelled", failure);
         } catch (BackupException failure) {
             throw failure;
         } catch (IOException | RuntimeException failure) {
             throw corruptArchive(failure);
         }
+    }
+
+    public static final class ArchiveDescription {
+        private final SnapshotManifest snapshot;
+        private final List<String> included;
+        private final List<String> deleted;
+        private ArchiveDescription(SnapshotManifest snapshot, List<String> included,
+                                   List<String> deleted) {
+            this.snapshot = snapshot;
+            this.included = Collections.unmodifiableList(new ArrayList<>(included));
+            this.deleted = Collections.unmodifiableList(new ArrayList<>(deleted));
+        }
+        public SnapshotManifest getSnapshot() { return snapshot; }
+        public List<String> getIncluded() { return included; }
+        public List<String> getDeleted() { return deleted; }
     }
 
     public void extract(Path archive, Path target) throws BackupException {
@@ -455,6 +484,7 @@ public final class ArchiveStore {
     private static ValidatedArchive openValidatedArchive(Path archive,
                                                          BackupCancellation cancellation)
             throws IOException, BackupException {
+        if (cancellation != null) cancellation.check();
         requireUnsymbolicRegularFile(archive, "archive");
         ZipFile zip = null;
         Set<String> names = new HashSet<>();
@@ -534,8 +564,8 @@ public final class ArchiveStore {
         }
     }
 
-    private static PayloadFingerprint fingerprint(InputStream input, byte[] buffer,
-                                                  BackupCancellation cancellation)
+    static PayloadFingerprint fingerprint(InputStream input, byte[] buffer,
+                                          BackupCancellation cancellation)
             throws IOException {
         MessageDigest digest = sha256();
         long size = 0L;
@@ -946,7 +976,7 @@ public final class ArchiveStore {
         }
     }
 
-    private static final class PayloadFingerprint {
+    static final class PayloadFingerprint {
         private final long size;
         private final String sha256;
 

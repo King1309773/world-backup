@@ -1,9 +1,5 @@
 package com.rlcmj.worldbackup.storage;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import com.rlcmj.worldbackup.core.BackupCatalog;
 import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupMode;
@@ -14,7 +10,6 @@ import com.rlcmj.worldbackup.core.SnapshotManifest;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.FileAlreadyExistsException;
@@ -44,8 +39,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
 
 public final class BackupRestorer {
     private static final String SESSION_LOCK = "session.lock";
@@ -230,9 +223,19 @@ public final class BackupRestorer {
     public AvailabilityReport validateAvailabilityBatch(Path repository, String worldId,
                                                          BackupCatalog catalog)
             throws BackupException {
+        return validateAvailabilityBatch(repository, worldId, catalog,
+            new com.rlcmj.worldbackup.core.BackupCancellation());
+    }
+
+    public AvailabilityReport validateAvailabilityBatch(Path repository, String worldId,
+                                                         BackupCatalog catalog,
+                                                         com.rlcmj.worldbackup.core.BackupCancellation cancellation)
+            throws BackupException {
         Objects.requireNonNull(repository, "repository");
         Objects.requireNonNull(catalog, "catalog");
+        Objects.requireNonNull(cancellation, "cancellation");
         try {
+            checkCancellation(cancellation);
             String safeWorldId = PortablePaths.requireSafeBasename(worldId);
             Path repo = requireDirectory(repository);
             validateCatalogFile(repo);
@@ -245,17 +248,13 @@ public final class BackupRestorer {
             Map<String, BackupVersion> byId = indexVersions(catalog);
             Map<String, List<BackupVersion>> chainCache = new HashMap<>();
             for (BackupVersion target : catalog.getVersions()) {
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new BackupException("worldbackup.error.cancelled");
-                }
+                checkCancellation(cancellation);
                 if (!target.isVisible()) continue;
                 try {
                     List<BackupVersion> chain = resolveChainCached(byId, target.getId(),
                         chainCache);
                     for (int index = 0; index < chain.size(); index++) {
-                        if (Thread.currentThread().isInterrupted()) {
-                            throw new BackupException("worldbackup.error.cancelled");
-                        }
+                        checkCancellation(cancellation);
                         BackupVersion version = chain.get(index);
                         String archiveName = version.getArchiveName();
                         if (archiveErrors.containsKey(archiveName)) {
@@ -265,9 +264,11 @@ public final class BackupRestorer {
                         if (inspection == null) {
                             try {
                                 Path archive = resolveArchive(repo, archiveName);
-                                inspection = new ArchiveInspection(
-                                    archiveStore.readManifest(archive),
-                                    readArchiveMetadata(archive));
+                                ArchiveStore.ArchiveDescription description =
+                                    archiveStore.readDescription(archive, cancellation);
+                                inspection = new ArchiveInspection(description.getSnapshot(),
+                                    new ArchiveMetadata(new TreeSet<>(description.getIncluded()),
+                                        new TreeSet<>(description.getDeleted())));
                                 inspections.put(archiveName, inspection);
                             } catch (BackupException failure) {
                                 archiveErrors.put(archiveName, failure.getTranslationKey());
@@ -277,15 +278,31 @@ public final class BackupRestorer {
                         validateArchiveInspection(chain, index, version, inspection);
                     }
                 } catch (BackupException failure) {
+                    if (cancellation.isCancelled()
+                            || "worldbackup.error.cancelled".equals(
+                                failure.getTranslationKey())) {
+                        throw failure;
+                    }
                     targetErrors.put(target.getId(), failure.getTranslationKey());
                 }
             }
+            checkCancellation(cancellation);
             return new AvailabilityReport(targetErrors,
                 inspections.size() + archiveErrors.size());
         } catch (BackupException failure) {
             throw failure;
         } catch (IllegalArgumentException | NullPointerException failure) {
             throw new BackupException("worldbackup.error.path_escape", failure);
+        }
+    }
+
+    private static void checkCancellation(
+            com.rlcmj.worldbackup.core.BackupCancellation cancellation)
+            throws BackupException {
+        try {
+            cancellation.check();
+        } catch (java.io.InterruptedIOException failure) {
+            throw new BackupException("worldbackup.error.cancelled", failure);
         }
     }
 
@@ -362,8 +379,12 @@ public final class BackupRestorer {
         for (int index = 0; index < chain.size(); index++) {
             BackupVersion version = chain.get(index);
             Path archive = resolveArchive(repository, version.getArchiveName());
+            ArchiveStore.ArchiveDescription description = archiveStore.readDescription(
+                archive, null);
             validateArchiveInspection(chain, index, version, new ArchiveInspection(
-                archiveStore.readManifest(archive), readArchiveMetadata(archive)));
+                description.getSnapshot(), new ArchiveMetadata(
+                    new TreeSet<>(description.getIncluded()),
+                    new TreeSet<>(description.getDeleted()))));
         }
     }
 
@@ -421,51 +442,6 @@ public final class BackupRestorer {
         public String getErrorKey(String versionId) { return errorKeys.get(versionId); }
         public Map<String, String> getErrorKeys() { return errorKeys; }
         public int getValidatedArchiveCount() { return validatedArchiveCount; }
-    }
-
-    private static ArchiveMetadata readArchiveMetadata(Path archive) throws BackupException {
-        try (ZipFile zip = new ZipFile(archive.toFile(),
-                java.nio.charset.StandardCharsets.UTF_8)) {
-            ZipEntry entry = zip.getEntry("manifest.json");
-            if (entry == null || entry.isDirectory()) {
-                throw new BackupException("worldbackup.error.archive_corrupt");
-            }
-            try (InputStream input = zip.getInputStream(entry);
-                 InputStreamReader reader = new InputStreamReader(input,
-                     java.nio.charset.StandardCharsets.UTF_8)) {
-                JsonElement parsed = new JsonParser().parse(reader);
-                if (!parsed.isJsonObject()) {
-                    throw new BackupException("worldbackup.error.archive_corrupt");
-                }
-                JsonObject object = parsed.getAsJsonObject();
-                return new ArchiveMetadata(readPaths(object, "includedPaths"),
-                    readPaths(object, "deletedPaths"));
-            }
-        } catch (BackupException failure) {
-            throw failure;
-        } catch (IOException | RuntimeException failure) {
-            throw new BackupException("worldbackup.error.archive_corrupt", failure);
-        }
-    }
-
-    private static Set<String> readPaths(JsonObject object, String name)
-            throws BackupException {
-        JsonElement value = object.get(name);
-        if (value == null || !value.isJsonArray()) {
-            throw new BackupException("worldbackup.error.archive_corrupt");
-        }
-        Set<String> result = new TreeSet<>();
-        JsonArray paths = value.getAsJsonArray();
-        for (JsonElement item : paths) {
-            if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) {
-                throw new BackupException("worldbackup.error.archive_corrupt");
-            }
-            String path = PortablePaths.normalizeRelativePath(item.getAsString());
-            if (!result.add(path)) {
-                throw new BackupException("worldbackup.error.archive_corrupt");
-            }
-        }
-        return result;
     }
 
     private void reconstruct(Path repository, Path temporary, List<BackupVersion> chain)

@@ -92,6 +92,37 @@ public class BackupRestorerTest {
     }
 
     @Test
+    public void batchAvailabilityPropagatesCancellationInsteadOfMarkingArchiveUnavailable()
+            throws Exception {
+        Fixture fixture = fixture();
+        fixture.chain(true);
+        BackupCatalog catalog = new CatalogStore().load(fixture.repo);
+        BackupCancellation cancellation = new BackupCancellation();
+        cancellation.cancel();
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> fixture.restorer().validateAvailabilityBatch(
+                fixture.repo, "World1", catalog, cancellation));
+
+        assertEquals("worldbackup.error.cancelled", failure.getTranslationKey());
+    }
+
+    @Test
+    public void batchAvailabilityHonorsCancellationForEmptyCatalog() throws Exception {
+        Fixture fixture = fixture();
+        BackupCatalog catalog = BackupCatalog.empty("World1", "World One");
+        new CatalogStore().save(fixture.repo, catalog);
+        BackupCancellation cancellation = new BackupCancellation();
+        cancellation.cancel();
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> fixture.restorer().validateAvailabilityBatch(
+                fixture.repo, "World1", catalog, cancellation));
+
+        assertEquals("worldbackup.error.cancelled", failure.getTranslationKey());
+    }
+
+    @Test
     public void restoresAnOlderTargetUsingHiddenDependenciesInsteadOfLatestVersion()
             throws Exception {
         Fixture fixture = fixture();

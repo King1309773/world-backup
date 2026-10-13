@@ -86,10 +86,11 @@ public class BackupManagerServiceTest {
 
     @Test
     public void backupDestructiveStateRequiresValidatedCatalogIdentity() {
-        assertFalse(GuiBackupManager.backupDestructiveEnabled(false, true, false));
-        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, false, false));
-        assertTrue(GuiBackupManager.backupDestructiveEnabled(true, true, false));
-        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, true));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(false, true, false, true));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, false, false, true));
+        assertTrue(GuiBackupManager.backupDestructiveEnabled(true, true, false, true));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, true, true));
+        assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, false, false));
     }
 
     @Test
