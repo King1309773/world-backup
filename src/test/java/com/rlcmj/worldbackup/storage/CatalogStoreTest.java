@@ -38,6 +38,53 @@ import static org.junit.Assert.assertTrue;
 
 public class CatalogStoreTest {
     @Test
+    public void oversizedSavePreservesPreviousCatalogAndCleansTemporaryFile()
+            throws Exception {
+        Path repo = temp.newFolder("oversized-save").toPath();
+        BackupCatalog previous = BackupCatalog.empty("World1", "World");
+        CatalogStore unrestricted = new CatalogStore();
+        unrestricted.save(repo, previous);
+        CatalogStore limited = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard), 256);
+        BackupCatalog oversized = BackupCatalog.empty("World1", repeat('x', 512));
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> limited.save(repo, oversized));
+
+        assertEquals("worldbackup.error.catalog_too_large", failure.getTranslationKey());
+        assertEquals(previous, unrestricted.load(repo));
+        assertFalse(Files.exists(repo.resolve("index.json.tmp")));
+    }
+
+    @Test
+    public void catalogExactlyAtConfiguredLimitRoundTrips() throws Exception {
+        Path repo = temp.newFolder("catalog-at-limit").toPath();
+        BackupCatalog catalog = BackupCatalog.empty("World1", repeat('x', 64));
+        int encodedCharacters = new com.google.gson.GsonBuilder().setPrettyPrinting()
+            .create().toJson(catalog).length();
+        CatalogStore store = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard), encodedCharacters);
+
+        store.save(repo, catalog);
+
+        assertEquals(catalog, store.load(repo));
+    }
+
+    @Test
+    public void oversizedLoadUsesExplicitSizeError() throws Exception {
+        Path repo = temp.newFolder("oversized-load").toPath();
+        Files.write(repo.resolve("index.json"), repeat(' ', 257)
+            .getBytes(StandardCharsets.UTF_8));
+        CatalogStore limited = new CatalogStore((target, writer, guard) ->
+            AtomicFiles.write(target, writer, guard), 256);
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> limited.load(repo));
+
+        assertEquals("worldbackup.error.catalog_too_large", failure.getTranslationKey());
+    }
+
+    @Test
     public void cancelledCatalogLoadStopsBeforeParsing() throws Exception {
         Path repo = temp.newFolder("cancel-load").toPath();
         Files.write(repo.resolve("index.json"), "{}".getBytes(StandardCharsets.UTF_8));
@@ -1165,5 +1212,11 @@ public class CatalogStoreTest {
         }
         return "{\"formatVersion\":1,\"worldId\":\"World1\","
             + "\"displayName\":\"World\",\"versions\":[],\"unknown\":" + value + "}";
+    }
+
+    private static String repeat(char value, int count) {
+        char[] values = new char[count];
+        Arrays.fill(values, value);
+        return new String(values);
     }
 }

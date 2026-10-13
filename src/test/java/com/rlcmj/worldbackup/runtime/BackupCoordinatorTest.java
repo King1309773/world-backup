@@ -622,9 +622,109 @@ public class BackupCoordinatorTest {
         assertFalse(coordinator.isBusy());
     }
 
+    @Test
+    public void shutdownSkipsExitWithoutOverlappingBlockedMaintenance() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.MILLISECONDS.toNanos(30));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        assertTrue(coordinator.requestMaintenance(() -> {
+            entered.countDown();
+            release.await();
+            runtime.events.add("maintenance-finished");
+            return "done";
+        }, noMaintenanceCallback()));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+        long started = System.nanoTime();
+        coordinator.onServerStopping(new Object());
+
+        assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1));
+        assertFalse(runtime.triggers.contains(BackupTrigger.EXIT));
+        assertEquals("worldbackup.message.exit_skipped_busy",
+            runtime.messages.get(runtime.messages.size() - 1));
+        release.countDown();
+    }
+
+    @Test
+    public void shutdownWaitsForMaintenanceBeforeExitAndLateClientCallbackIsIdempotent()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.deferClientSchedule = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicLong callbacks = new AtomicLong();
+        assertTrue(coordinator.requestMaintenance(() -> {
+            entered.countDown();
+            release.await();
+            runtime.events.add("maintenance-finished");
+            return "done";
+        }, new BackupCoordinator.MaintenanceCallback<String>() {
+            @Override public void succeeded(String value) { callbacks.incrementAndGet(); }
+            @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
+        }));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        Thread stopping = new Thread(() -> coordinator.onServerStopping(new Object()));
+        stopping.start();
+        Thread.yield();
+        assertFalse(runtime.triggers.contains(BackupTrigger.EXIT));
+
+        release.countDown();
+        stopping.join(2000L);
+
+        assertFalse(stopping.isAlive());
+        assertTrue(runtime.events.indexOf("maintenance-finished")
+            < runtime.events.indexOf("backup-EXIT"));
+        assertFalse(coordinator.isBusy());
+        runtime.runDeferredClientSchedule();
+        assertEquals(1L, callbacks.get());
+        assertFalse(coordinator.isBusy());
+    }
+
+    @Test
+    public void shutdownSkipsExitWhileRestoreOwnsWorker() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.MILLISECONDS.toNanos(30));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        assertTrue(coordinator.requestRestore(() -> {
+            entered.countDown();
+            release.await();
+            return Paths.get("restored");
+        }, noRestoreCallback()));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+        coordinator.onServerStopping(new Object());
+
+        assertFalse(runtime.triggers.contains(BackupTrigger.EXIT));
+        assertEquals("worldbackup.message.exit_skipped_busy",
+            runtime.messages.get(runtime.messages.size() - 1));
+        release.countDown();
+    }
+
     private static BackupCoordinator.RestoreCallback noRestoreCallback() {
         return new BackupCoordinator.RestoreCallback() {
             @Override public void succeeded(java.nio.file.Path restored) { }
+            @Override public void failed(Throwable failure) { }
+        };
+    }
+
+    private static BackupCoordinator.MaintenanceCallback<String> noMaintenanceCallback() {
+        return new BackupCoordinator.MaintenanceCallback<String>() {
+            @Override public void succeeded(String value) { }
             @Override public void failed(Throwable failure) { }
         };
     }

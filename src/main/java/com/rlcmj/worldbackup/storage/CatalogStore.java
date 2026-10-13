@@ -25,8 +25,10 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.StringReader;
+import java.io.Writer;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -44,14 +46,21 @@ public final class CatalogStore {
     static final int MAX_INDEX_CHARS = 64 * 1024 * 1024;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final AtomicWriter atomicWriter;
+    private final int maxIndexChars;
 
     public CatalogStore() {
         this((target, writer, publishGuard) ->
-            AtomicFiles.write(target, writer, publishGuard));
+            AtomicFiles.write(target, writer, publishGuard), MAX_INDEX_CHARS);
     }
 
     CatalogStore(AtomicWriter atomicWriter) {
+        this(atomicWriter, MAX_INDEX_CHARS);
+    }
+
+    CatalogStore(AtomicWriter atomicWriter, int maxIndexChars) {
         this.atomicWriter = Objects.requireNonNull(atomicWriter, "atomicWriter");
+        if (maxIndexChars < 1) throw new IllegalArgumentException("maxIndexChars");
+        this.maxIndexChars = maxIndexChars;
     }
 
     interface AtomicWriter {
@@ -67,15 +76,9 @@ public final class CatalogStore {
                      BackupCancellation cancellation) throws BackupException {
         Objects.requireNonNull(cancellation, "cancellation");
         validate(catalog);
-        final byte[] encoded;
-        try {
-            encoded = gson.toJson(catalog).getBytes(StandardCharsets.UTF_8);
-        } catch (JsonIOException failure) {
-            throw new BackupException("worldbackup.error.catalog_write", failure);
-        }
         try {
             atomicWriter.write(repository.resolve(INDEX_NAME),
-                output -> output.write(encoded),
+                output -> writeCatalog(output, catalog),
                 new AtomicFiles.PublishGuard() {
                     @Override public void publish(AtomicFiles.IOAction publication)
                             throws IOException {
@@ -90,10 +93,33 @@ public final class CatalogStore {
 
                     @Override public boolean supportsRollback() { return true; }
                 });
+        } catch (CatalogTooLargeException failure) {
+            throw new BackupException("worldbackup.error.catalog_too_large", failure);
         } catch (InterruptedIOException failure) {
             throw new BackupException("worldbackup.error.cancelled", failure);
+        } catch (JsonIOException failure) {
+            CatalogTooLargeException tooLarge = findTooLarge(failure);
+            if (tooLarge != null) {
+                throw new BackupException("worldbackup.error.catalog_too_large", tooLarge);
+            }
+            throw new BackupException("worldbackup.error.catalog_write", failure);
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.catalog_write", failure);
+        } catch (OutOfMemoryError failure) {
+            throw new BackupException("worldbackup.error.catalog_too_large", failure);
+        }
+    }
+
+    private void writeCatalog(OutputStream output, BackupCatalog catalog) throws IOException {
+        LimitedWriter writer = new LimitedWriter(
+            new OutputStreamWriter(output, StandardCharsets.UTF_8), maxIndexChars);
+        try {
+            gson.toJson(catalog, writer);
+            writer.flush();
+        } catch (JsonIOException failure) {
+            CatalogTooLargeException tooLarge = findTooLarge(failure);
+            if (tooLarge != null) throw tooLarge;
+            throw failure;
         }
     }
 
@@ -107,9 +133,12 @@ public final class CatalogStore {
         try (Reader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
             try {
                 JsonElement json = readDocument(reader, cancellation);
+                checkCancellation(cancellation);
                 readFormatVersion(json);
                 validateStructure(json.getAsJsonObject());
+                checkCancellation(cancellation);
                 BackupCatalog catalog = gson.fromJson(json, BackupCatalog.class);
+                checkCancellation(cancellation);
                 validate(catalog);
                 return catalog;
             } catch (BackupException failure) {
@@ -123,20 +152,26 @@ public final class CatalogStore {
             throw failure;
         } catch (InterruptedIOException failure) {
             throw new BackupException("worldbackup.error.cancelled", failure);
+        } catch (CatalogTooLargeException failure) {
+            throw new BackupException("worldbackup.error.catalog_too_large", failure);
         } catch (IOException failure) {
             throw new BackupException("worldbackup.error.catalog_read", failure);
+        } catch (OutOfMemoryError failure) {
+            throw new BackupException("worldbackup.error.catalog_too_large", failure);
         }
     }
 
-    private static JsonElement readDocument(Reader source,
-                                            BackupCancellation cancellation)
+    private JsonElement readDocument(Reader source, BackupCancellation cancellation)
             throws IOException {
         String rawJson = readAll(source, cancellation);
+        checkCancellation(cancellation);
         validateRawJsonStrings(rawJson);
+        checkCancellation(cancellation);
         JsonReader reader = new JsonReader(new StringReader(rawJson));
         reader.setLenient(false);
         try {
             JsonElement value = readValue(reader, 1);
+            checkCancellation(cancellation);
             if (reader.peek() != JsonToken.END_DOCUMENT) {
                 throw new CatalogSyntaxException("Trailing JSON content");
             }
@@ -147,20 +182,58 @@ public final class CatalogStore {
         }
     }
 
-    private static String readAll(Reader source, BackupCancellation cancellation)
+    private String readAll(Reader source, BackupCancellation cancellation)
             throws IOException {
         StringBuilder text = new StringBuilder();
         char[] buffer = new char[4096];
         int count;
         while ((count = source.read(buffer)) != -1) {
             if (cancellation != null) cancellation.check();
-            if (text.length() > MAX_INDEX_CHARS - count) {
-                throw new CatalogSyntaxException("Catalog exceeds size limit");
+            if (text.length() > maxIndexChars - count) {
+                throw new CatalogTooLargeException();
             }
             text.append(buffer, 0, count);
         }
         if (cancellation != null) cancellation.check();
         return text.toString();
+    }
+
+    private static void checkCancellation(BackupCancellation cancellation)
+            throws InterruptedIOException {
+        if (cancellation != null) cancellation.check();
+    }
+
+    private static CatalogTooLargeException findTooLarge(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof CatalogTooLargeException) {
+                return (CatalogTooLargeException) current;
+            }
+        }
+        return null;
+    }
+
+    private static final class LimitedWriter extends Writer {
+        private final Writer delegate;
+        private final int limit;
+        private int written;
+
+        private LimitedWriter(Writer delegate, int limit) {
+            this.delegate = delegate;
+            this.limit = limit;
+        }
+
+        @Override public void write(char[] values, int offset, int length) throws IOException {
+            if (written > limit - length) throw new CatalogTooLargeException();
+            delegate.write(values, offset, length);
+            written += length;
+        }
+
+        @Override public void flush() throws IOException { delegate.flush(); }
+        @Override public void close() throws IOException { delegate.close(); }
+    }
+
+    private static final class CatalogTooLargeException extends IOException {
+        private CatalogTooLargeException() { super("Catalog exceeds size limit"); }
     }
 
     private static void validateRawJsonStrings(String source) {

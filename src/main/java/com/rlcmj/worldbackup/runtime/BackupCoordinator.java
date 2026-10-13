@@ -44,7 +44,8 @@ public final class BackupCoordinator {
     private final long shutdownWaitNanos;
     private final AtomicReference<ActiveBackup> active = new AtomicReference<>();
     private final AtomicBoolean restoreActive = new AtomicBoolean();
-    private final AtomicBoolean maintenanceActive = new AtomicBoolean();
+    private final AtomicReference<ActiveMaintenance> maintenance = new AtomicReference<>();
+    private final AtomicBoolean shutdownArbitrating = new AtomicBoolean();
     private final ConcurrentLinkedQueue<Runnable> pendingClientCallbacks =
         new ConcurrentLinkedQueue<>();
     private final Object arbitration = new Object();
@@ -79,7 +80,7 @@ public final class BackupCoordinator {
         }
         ActiveBackup candidate = new ActiveBackup(server, trigger, clock.nanoTime());
         synchronized (arbitration) {
-            if (restoreActive.get() || maintenanceActive.get()
+            if (restoreActive.get() || maintenance.get() != null || shutdownArbitrating.get()
                     || !active.compareAndSet(null, candidate)) {
                 runtime.message("worldbackup.message.busy");
                 return false;
@@ -102,7 +103,7 @@ public final class BackupCoordinator {
         Objects.requireNonNull(operation, "operation");
         Objects.requireNonNull(callback, "callback");
         synchronized (arbitration) {
-            if (active.get() != null || maintenanceActive.get()
+            if (active.get() != null || maintenance.get() != null || shutdownArbitrating.get()
                     || !restoreActive.compareAndSet(false, true)) {
                 runtime.message("worldbackup.message.busy");
                 return false;
@@ -139,7 +140,7 @@ public final class BackupCoordinator {
     }
 
     public boolean isBusy() {
-        return active.get() != null || restoreActive.get() || maintenanceActive.get();
+        return active.get() != null || restoreActive.get() || maintenance.get() != null;
     }
 
     public boolean isRestoreActive() {
@@ -150,9 +151,11 @@ public final class BackupCoordinator {
                                           MaintenanceCallback<T> callback) {
         Objects.requireNonNull(operation, "operation");
         Objects.requireNonNull(callback, "callback");
+        ActiveMaintenance candidate = new ActiveMaintenance();
         synchronized (arbitration) {
             if (active.get() != null || restoreActive.get()
-                    || !maintenanceActive.compareAndSet(false, true)) {
+                    || shutdownArbitrating.get()
+                    || !maintenance.compareAndSet(null, candidate)) {
                 runtime.message("worldbackup.message.busy");
                 return false;
             }
@@ -168,23 +171,39 @@ public final class BackupCoordinator {
                 }
                 final T completedResult = result;
                 final Throwable completedFailure = failure;
-                Runnable completion = () -> {
-                    maintenanceActive.set(false);
+                candidate.completion = () -> {
                     if (completedFailure == null) callback.succeeded(completedResult);
                     else callback.failed(completedFailure);
                 };
+                Runnable completion = () -> finishMaintenance(candidate);
                 try {
                     runtime.scheduleClient(completion);
                 } catch (Throwable schedulingFailure) {
                     pendingClientCallbacks.add(completion);
+                } finally {
+                    // Signals the whole worker action, including publishing (or safely
+                    // queueing) its terminal callback. Shutdown may rely on this to
+                    // begin an EXIT backup without racing repository maintenance.
+                    candidate.workerDone.complete(null);
                 }
             });
         } catch (Throwable submissionFailure) {
-            maintenanceActive.set(false);
+            candidate.workerDone.complete(null);
+            candidate.terminal.set(true);
+            maintenance.compareAndSet(candidate, null);
             callback.failed(submissionFailure);
             return false;
         }
         return true;
+    }
+
+    private void finishMaintenance(ActiveMaintenance candidate) {
+        candidate.terminal.compareAndSet(false, true);
+        maintenance.compareAndSet(candidate, null);
+        if (candidate.callbackDelivered.compareAndSet(false, true)) {
+            Runnable completion = candidate.completion;
+            if (completion != null) completion.run();
+        }
     }
 
     public void retryClientCallbacks() {
@@ -213,6 +232,33 @@ public final class BackupCoordinator {
     }
 
     void onServerStopping(Object server) {
+        ActiveMaintenance stoppingMaintenance;
+        synchronized (arbitration) {
+            shutdownArbitrating.set(true);
+            if (restoreActive.get()) {
+                shutdownArbitrating.set(false);
+                runtime.message("worldbackup.message.exit_skipped_busy");
+                return;
+            }
+            stoppingMaintenance = maintenance.get();
+        }
+        if (stoppingMaintenance != null) {
+            try {
+                stoppingMaintenance.workerDone.get(shutdownWaitNanos,
+                    TimeUnit.NANOSECONDS);
+                stoppingMaintenance.terminal.compareAndSet(false, true);
+                maintenance.compareAndSet(stoppingMaintenance, null);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                shutdownArbitrating.set(false);
+                runtime.message("worldbackup.message.exit_skipped_busy");
+                return;
+            } catch (ExecutionException | TimeoutException failure) {
+                shutdownArbitrating.set(false);
+                runtime.message("worldbackup.message.exit_skipped_busy");
+                return;
+            }
+        }
         ActiveBackup current = active.get();
         Object snapshot = null;
         boolean ownsActive = current != null && current.server == server
@@ -281,6 +327,7 @@ public final class BackupCoordinator {
             runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
                 new TextComponentTranslation(exitResult.getErrorKey()));
         }
+        shutdownArbitrating.set(false);
     }
 
     private void releaseActiveWorlds(ActiveBackup backup) throws Exception {
@@ -741,6 +788,13 @@ public final class BackupCoordinator {
             Cancellable current = watchdog;
             if (current != null) current.cancel();
         }
+    }
+
+    private static final class ActiveMaintenance {
+        private final CompletableFuture<Void> workerDone = new CompletableFuture<>();
+        private final AtomicBoolean terminal = new AtomicBoolean();
+        private final AtomicBoolean callbackDelivered = new AtomicBoolean();
+        private volatile Runnable completion;
     }
 
     private static final class Completion {

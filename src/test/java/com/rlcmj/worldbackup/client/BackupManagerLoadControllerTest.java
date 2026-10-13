@@ -82,6 +82,33 @@ public class BackupManagerLoadControllerTest {
         assertTrue(controller.isLoaded());
     }
 
+    @Test
+    public void failedLoadCanReloadAndPublishCurrentDiskState() throws Exception {
+        Queue<Runnable> clientTasks = new ConcurrentLinkedQueue<>();
+        BackupManagerLoadController<String> controller =
+            new BackupManagerLoadController<>(worker, clientTasks::add);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<String> published = new AtomicReference<>();
+        controller.start(cancellation -> {
+            throw new java.io.IOException("delete failed");
+        }, new BackupManagerLoadController.Completion<String>() {
+            @Override public void succeeded(String value) { published.set(value); }
+            @Override public void failed(Throwable thrown) { failure.set(thrown); }
+        });
+        await(() -> !clientTasks.isEmpty());
+        clientTasks.remove().run();
+        assertFalse(controller.isLoaded());
+        assertEquals("delete failed", failure.get().getMessage());
+
+        controller.start(cancellation -> "actual-disk-state",
+            completion(published, new AtomicReference<Thread>()));
+        await(() -> !clientTasks.isEmpty());
+        clientTasks.remove().run();
+
+        assertTrue(controller.isLoaded());
+        assertEquals("actual-disk-state", published.get());
+    }
+
     private static BackupManagerLoadController.Completion<String> completion(
             AtomicReference<String> published, AtomicReference<Thread> callbackThread) {
         return new BackupManagerLoadController.Completion<String>() {

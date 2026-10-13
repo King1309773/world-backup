@@ -200,7 +200,9 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
                 && !coordinator.isBusy()
             : backupDestructiveEnabled(viewState.getSelection() >= 0,
                 catalogIdentityValidated, coordinator.isBusy(), loadController.isLoaded());
-        find(DONE).enabled = !coordinator.isRestoreActive();
+        boolean navigationEnabled = managerNavigationEnabled(coordinator.isBusy());
+        find(SAFETY).enabled = navigationEnabled;
+        find(DONE).enabled = navigationEnabled;
         int pages = pageCount();
         find(PREVIOUS).enabled = viewState.getPage() > 0;
         find(NEXT).enabled = viewState.getPage() + 1 < pages;
@@ -294,8 +296,7 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
             }
             @Override public void failed(Throwable failure) {
                 if (!screenActive) return;
-                setStatus(errorKey(failure));
-                updateButtons();
+                startLoad(false, errorKey(failure), new Object[0]);
             }
         };
     }
@@ -321,7 +322,9 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
 
     @Override protected void keyTyped(char typedChar, int keyCode) throws IOException {
-        if (!coordinator.isRestoreActive()) super.keyTyped(typedChar, keyCode);
+        if (managerNavigationEnabled(coordinator.isBusy())) {
+            super.keyTyped(typedChar, keyCode);
+        }
     }
 
     @Override protected void mouseClicked(int mouseX, int mouseY, int mouseButton)
@@ -426,9 +429,13 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
                                             boolean busy, boolean loaded) {
         return loaded && hasSelection && identityValidated && !busy;
     }
+    static boolean managerNavigationEnabled(boolean busy) { return !busy; }
     static String errorKey(Throwable failure) {
         Throwable cursor = failure;
         while (cursor != null) {
+            if (cursor instanceof OutOfMemoryError) {
+                return "worldbackup.error.catalog_too_large";
+            }
             if (cursor instanceof BackupException) {
                 return ((BackupException) cursor).getTranslationKey();
             }

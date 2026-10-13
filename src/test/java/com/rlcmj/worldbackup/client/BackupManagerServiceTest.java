@@ -91,6 +91,14 @@ public class BackupManagerServiceTest {
         assertTrue(GuiBackupManager.backupDestructiveEnabled(true, true, false, true));
         assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, true, true));
         assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, false, false));
+        assertFalse(GuiBackupManager.managerNavigationEnabled(true));
+        assertTrue(GuiBackupManager.managerNavigationEnabled(false));
+    }
+
+    @Test
+    public void backgroundCatalogMemoryFailureUsesSafeLocalizedMessage() {
+        assertEquals("worldbackup.error.catalog_too_large",
+            GuiBackupManager.errorKey(new OutOfMemoryError("catalog")));
     }
 
     @Test
