@@ -26,6 +26,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -43,6 +44,8 @@ public final class BackupCoordinator {
     private final long shutdownWaitNanos;
     private final AtomicReference<ActiveBackup> active = new AtomicReference<>();
     private final AtomicBoolean restoreActive = new AtomicBoolean();
+    private final ConcurrentLinkedQueue<Runnable> pendingClientCallbacks =
+        new ConcurrentLinkedQueue<>();
     private final Object arbitration = new Object();
 
     public BackupCoordinator() {
@@ -113,15 +116,15 @@ public final class BackupCoordinator {
                 }
                 final Path completedPath = restored;
                 final Throwable completedFailure = failure;
-                try {
-                    runtime.scheduleClient(() -> {
-                        restoreActive.set(false);
-                        if (completedFailure == null) callback.succeeded(completedPath);
-                        else callback.failed(completedFailure);
-                    });
-                } catch (Throwable schedulingFailure) {
+                Runnable completion = () -> {
                     restoreActive.set(false);
-                    callback.failed(schedulingFailure);
+                    if (completedFailure == null) callback.succeeded(completedPath);
+                    else callback.failed(completedFailure);
+                };
+                try {
+                    runtime.scheduleClient(completion);
+                } catch (Throwable schedulingFailure) {
+                    pendingClientCallbacks.add(completion);
                 }
             });
         } catch (Throwable submissionFailure) {
@@ -138,6 +141,11 @@ public final class BackupCoordinator {
 
     public boolean isRestoreActive() {
         return restoreActive.get();
+    }
+
+    public void retryClientCallbacks() {
+        Runnable callback;
+        while ((callback = pendingClientCallbacks.poll()) != null) callback.run();
     }
 
     @FunctionalInterface

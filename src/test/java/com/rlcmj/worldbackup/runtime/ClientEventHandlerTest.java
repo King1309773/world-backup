@@ -49,4 +49,11 @@ public class ClientEventHandlerTest {
         assertFalse(timer.due(server, true, 500L, 589L));
         assertTrue(timer.due(server, true, 500L, 590L));
     }
+
+    @Test
+    public void restoreGuardBlocksWorldListInputAndOpeningOnlyWhileRestoreIsActive() {
+        assertTrue(ClientEventHandler.RestoreUiGuard.blocks(true, true));
+        assertFalse(ClientEventHandler.RestoreUiGuard.blocks(false, true));
+        assertFalse(ClientEventHandler.RestoreUiGuard.blocks(true, false));
+    }
 }

@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -74,6 +75,20 @@ public class BackupRestorerTest {
             () -> fixture.restorer().validateAvailability(
                 fixture.repo, "World1", chain.v3.getId()));
         assertEquals("worldbackup.error.archive_corrupt", error.getTranslationKey());
+    }
+
+    @Test
+    public void batchAvailabilityValidatesSharedBaseArchiveOnlyOnce() throws Exception {
+        Fixture fixture = fixture();
+        Chain chain = fixture.chain(true);
+        BackupCatalog catalog = new CatalogStore().load(fixture.repo);
+
+        BackupRestorer.AvailabilityReport report = fixture.restorer()
+            .validateAvailabilityBatch(fixture.repo, "World1", catalog);
+
+        assertEquals(3, report.getValidatedArchiveCount());
+        assertEquals(null, report.getErrorKey(chain.v1.getId()));
+        assertEquals(null, report.getErrorKey(chain.v3.getId()));
     }
 
     @Test

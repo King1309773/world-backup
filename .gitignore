@@ -2,6 +2,7 @@
 .toolchains/
 build/
 run/
+logs/
 out/
 *.zip
 .classpath

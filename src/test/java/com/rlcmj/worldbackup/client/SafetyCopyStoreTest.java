@@ -178,4 +178,90 @@ public class SafetyCopyStoreTest {
 
         assertFalse(Files.exists(copy));
     }
+
+    @Test
+    public void targetSwappedToLinkAfterValidationNeverDeletesExternalTree()
+            throws Exception {
+        Path game = temp.newFolder("game-target-swap").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        Path copy = Files.createDirectory(root.resolve("World1-20261009-010203-004"));
+        Files.write(copy.resolve("original.dat"), new byte[] { 1 });
+        Path parked = root.resolve("parked-original");
+        Path outside = temp.newFolder("outside-target-swap").toPath();
+        Path canary = Files.write(outside.resolve("canary.dat"), new byte[] { 7 });
+        try {
+            Path probe = root.resolve("probe-link");
+            Files.createSymbolicLink(probe, outside);
+            Files.delete(probe);
+        } catch (UnsupportedOperationException | java.io.IOException failure) {
+            org.junit.Assume.assumeNoException(failure);
+        }
+        SafetyCopyStore store = new SafetyCopyStore(
+            path -> 0,
+            target -> {
+                Files.move(target, parked);
+                Files.createSymbolicLink(target, outside);
+            },
+            () -> "fixed");
+
+        assertThrows(BackupException.class, () -> store.delete(
+            game, "World1", copy.getFileName().toString()));
+
+        assertTrue(Files.exists(canary));
+        assertTrue(Files.exists(copy, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(parked.resolve("original.dat")));
+    }
+
+    @Test
+    public void unsafeNestedSwapAfterCommitIsRevalidatedAndRolledBack() throws Exception {
+        Path game = temp.newFolder("game-nested-swap").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        Path copy = Files.createDirectory(root.resolve("World1-20261009-010203-004"));
+        Files.write(copy.resolve("original.dat"), new byte[] { 1 });
+        Path outside = temp.newFolder("outside-nested-swap").toPath();
+        Path canary = Files.write(outside.resolve("canary.dat"), new byte[] { 7 });
+        try {
+            Path probe = root.resolve("probe-link");
+            Files.createSymbolicLink(probe, outside);
+            Files.delete(probe);
+        } catch (UnsupportedOperationException | java.io.IOException failure) {
+            org.junit.Assume.assumeNoException(failure);
+        }
+        SafetyCopyStore store = new SafetyCopyStore(path -> 0,
+            target -> Files.createSymbolicLink(target.resolve("late-link"), outside),
+            () -> "fixed");
+
+        assertThrows(BackupException.class, () -> store.delete(
+            game, "World1", copy.getFileName().toString()));
+
+        assertTrue(Files.exists(copy, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(copy.resolve("original.dat")));
+        assertTrue(Files.exists(copy.resolve("late-link"), LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(canary));
+        assertFalse(Files.exists(root.resolve(".deleting-World1-fixed"),
+            LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void safetyRootReplacementAfterValidationNeverDeletesExternalTree()
+            throws Exception {
+        Path game = temp.newFolder("game-root-swap").toPath();
+        Path root = Files.createDirectories(game.resolve("restore-safety"));
+        String copyName = "World1-20261009-010203-004";
+        Path copy = Files.createDirectory(root.resolve(copyName));
+        Files.write(copy.resolve("original.dat"), new byte[] { 1 });
+        Path parkedRoot = game.resolve("parked-root");
+        final Path[] canary = new Path[1];
+        SafetyCopyStore store = new SafetyCopyStore(path -> 0, target -> {
+            Files.move(root, parkedRoot);
+            Path replacement = Files.createDirectories(root.resolve(copyName));
+            canary[0] = Files.write(replacement.resolve("canary.dat"), new byte[] { 7 });
+        }, () -> "fixed");
+
+        assertThrows(BackupException.class,
+            () -> store.delete(game, "World1", copyName));
+
+        assertTrue(Files.exists(canary[0]));
+        assertTrue(Files.exists(parkedRoot.resolve(copyName).resolve("original.dat")));
+    }
 }

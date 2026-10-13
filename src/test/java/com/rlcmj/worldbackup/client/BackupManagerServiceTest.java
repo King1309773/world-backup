@@ -92,6 +92,20 @@ public class BackupManagerServiceTest {
         assertFalse(GuiBackupManager.backupDestructiveEnabled(true, true, true));
     }
 
+    @Test
+    public void catalogLoadDoesNotReadOrHashArchivePayloads() throws Exception {
+        Path repo = temp.newFolder("catalog-only-load").toPath();
+        BackupCatalog catalog = BackupCatalog.empty("World1", "World One");
+        catalog.add(version("visible", BackupMode.FULL, "missing.zip",
+            null, null, true));
+        new CatalogStore().save(repo, catalog);
+
+        BackupCatalog loaded = new BackupManagerService().load(repo, "World1");
+
+        assertEquals(catalog, loaded);
+        assertFalse(Files.exists(repo.resolve("missing.zip")));
+    }
+
     private static BackupVersion version(String id, BackupMode mode, String archive,
                                          String parent, String base, boolean visible) {
         return new BackupVersion(id, 1L, BackupTrigger.MANUAL, mode, archive,

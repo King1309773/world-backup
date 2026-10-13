@@ -227,7 +227,74 @@ public final class BackupRestorer {
         }
     }
 
+    public AvailabilityReport validateAvailabilityBatch(Path repository, String worldId,
+                                                         BackupCatalog catalog)
+            throws BackupException {
+        Objects.requireNonNull(repository, "repository");
+        Objects.requireNonNull(catalog, "catalog");
+        try {
+            String safeWorldId = PortablePaths.requireSafeBasename(worldId);
+            Path repo = requireDirectory(repository);
+            validateCatalogFile(repo);
+            if (!safeWorldId.equals(catalog.getWorldId())) {
+                throw new BackupException("worldbackup.error.catalog_mismatch");
+            }
+            Map<String, ArchiveInspection> inspections = new HashMap<>();
+            Map<String, String> archiveErrors = new HashMap<>();
+            Map<String, String> targetErrors = new HashMap<>();
+            Map<String, BackupVersion> byId = indexVersions(catalog);
+            Map<String, List<BackupVersion>> chainCache = new HashMap<>();
+            for (BackupVersion target : catalog.getVersions()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new BackupException("worldbackup.error.cancelled");
+                }
+                if (!target.isVisible()) continue;
+                try {
+                    List<BackupVersion> chain = resolveChainCached(byId, target.getId(),
+                        chainCache);
+                    for (int index = 0; index < chain.size(); index++) {
+                        if (Thread.currentThread().isInterrupted()) {
+                            throw new BackupException("worldbackup.error.cancelled");
+                        }
+                        BackupVersion version = chain.get(index);
+                        String archiveName = version.getArchiveName();
+                        if (archiveErrors.containsKey(archiveName)) {
+                            throw new BackupException(archiveErrors.get(archiveName));
+                        }
+                        ArchiveInspection inspection = inspections.get(archiveName);
+                        if (inspection == null) {
+                            try {
+                                Path archive = resolveArchive(repo, archiveName);
+                                inspection = new ArchiveInspection(
+                                    archiveStore.readManifest(archive),
+                                    readArchiveMetadata(archive));
+                                inspections.put(archiveName, inspection);
+                            } catch (BackupException failure) {
+                                archiveErrors.put(archiveName, failure.getTranslationKey());
+                                throw failure;
+                            }
+                        }
+                        validateArchiveInspection(chain, index, version, inspection);
+                    }
+                } catch (BackupException failure) {
+                    targetErrors.put(target.getId(), failure.getTranslationKey());
+                }
+            }
+            return new AvailabilityReport(targetErrors,
+                inspections.size() + archiveErrors.size());
+        } catch (BackupException failure) {
+            throw failure;
+        } catch (IllegalArgumentException | NullPointerException failure) {
+            throw new BackupException("worldbackup.error.path_escape", failure);
+        }
+    }
+
     private List<BackupVersion> resolveChain(BackupCatalog catalog, String targetId)
+            throws BackupException {
+        return resolveChainCached(indexVersions(catalog), targetId, new HashMap<>());
+    }
+
+    private static Map<String, BackupVersion> indexVersions(BackupCatalog catalog)
             throws BackupException {
         Map<String, BackupVersion> byId = new HashMap<>();
         for (BackupVersion version : catalog.getVersions()) {
@@ -235,54 +302,59 @@ public final class BackupRestorer {
                 throw chainError("Duplicate version ID: " + version.getId());
             }
         }
-        BackupVersion current = byId.get(targetId);
-        if (current == null) {
+        return byId;
+    }
+
+    private static List<BackupVersion> resolveChainCached(
+            Map<String, BackupVersion> byId, String targetId,
+            Map<String, List<BackupVersion>> cache) throws BackupException {
+        BackupVersion target = byId.get(targetId);
+        if (target == null) {
             throw chainError("Unknown target version: " + targetId);
         }
-        if (!current.isVisible()) {
+        if (!target.isVisible()) {
             throw chainError("Target version is an internal dependency: " + targetId);
         }
+        return buildChain(target, byId, cache, new HashSet<>());
+    }
 
-        List<BackupVersion> reverse = new ArrayList<>();
-        Set<String> visited = new HashSet<>();
-        while (true) {
-            if (!visited.add(current.getId())) {
-                throw chainError("Cycle at version: " + current.getId());
+    private static List<BackupVersion> buildChain(BackupVersion current,
+            Map<String, BackupVersion> byId, Map<String, List<BackupVersion>> cache,
+            Set<String> visiting) throws BackupException {
+        List<BackupVersion> cached = cache.get(current.getId());
+        if (cached != null) return cached;
+        if (!visiting.add(current.getId())) {
+            throw chainError("Cycle at version: " + current.getId());
+        }
+        List<BackupVersion> chain;
+        if (current.getMode() == BackupMode.FULL
+                || current.getMode() == BackupMode.OVERWRITE) {
+            if (current.getParentId() != null || current.getBaseId() != null) {
+                throw chainError("Independent backup has dependencies: " + current.getId());
             }
-            reverse.add(current);
-            if (current.getMode() == BackupMode.FULL
-                    || current.getMode() == BackupMode.OVERWRITE) {
-                if (current.getParentId() != null || current.getBaseId() != null) {
-                    throw chainError("Independent backup has dependencies: " + current.getId());
-                }
-                break;
-            }
-            if (current.getMode() != BackupMode.INCREMENTAL
-                    || current.getParentId() == null || current.getBaseId() == null) {
+            chain = Collections.singletonList(current);
+        } else {
+            if (current.getMode() != BackupMode.INCREMENTAL || current.getParentId() == null
+                    || current.getBaseId() == null) {
                 throw chainError("Invalid incremental version: " + current.getId());
             }
             BackupVersion parent = byId.get(current.getParentId());
             if (parent == null) {
                 throw chainError("Missing parent: " + current.getParentId());
             }
-            current = parent;
-        }
-        Collections.reverse(reverse);
-
-        BackupVersion base = reverse.get(0);
-        if (reverse.size() > 1 && base.getMode() != BackupMode.FULL) {
-            throw chainError("Incremental chain does not start at a full backup");
-        }
-        for (int index = 1; index < reverse.size(); index++) {
-            BackupVersion previous = reverse.get(index - 1);
-            BackupVersion delta = reverse.get(index);
-            if (delta.getMode() != BackupMode.INCREMENTAL
-                    || !previous.getId().equals(delta.getParentId())
-                    || !base.getId().equals(delta.getBaseId())) {
-                throw chainError("Incompatible dependency at: " + delta.getId());
+            List<BackupVersion> parentChain = buildChain(parent, byId, cache, visiting);
+            BackupVersion base = parentChain.get(0);
+            if (base.getMode() != BackupMode.FULL
+                    || !base.getId().equals(current.getBaseId())) {
+                throw chainError("Incompatible dependency at: " + current.getId());
             }
+            chain = new ArrayList<>(parentChain);
+            chain.add(current);
         }
-        return reverse;
+        visiting.remove(current.getId());
+        List<BackupVersion> immutable = Collections.unmodifiableList(chain);
+        cache.put(current.getId(), immutable);
+        return immutable;
     }
 
     private void validateArchives(Path repository, List<BackupVersion> chain)
@@ -290,8 +362,16 @@ public final class BackupRestorer {
         for (int index = 0; index < chain.size(); index++) {
             BackupVersion version = chain.get(index);
             Path archive = resolveArchive(repository, version.getArchiveName());
-            SnapshotManifest archived = archiveStore.readManifest(archive);
-            if (!archived.equals(version.getManifest())) {
+            validateArchiveInspection(chain, index, version, new ArchiveInspection(
+                archiveStore.readManifest(archive), readArchiveMetadata(archive)));
+        }
+    }
+
+    private static void validateArchiveInspection(List<BackupVersion> chain, int index,
+                                                   BackupVersion version,
+                                                   ArchiveInspection inspection)
+            throws BackupException {
+            if (!inspection.manifest.equals(version.getManifest())) {
                 throw chainError("Archive manifest differs from catalog: " + version.getId());
             }
             Set<String> expectedIncluded;
@@ -315,13 +395,32 @@ public final class BackupRestorer {
                         + version.getId());
                 }
             }
-            ArchiveMetadata metadata = readArchiveMetadata(archive);
-            if (!expectedIncluded.equals(metadata.included)
-                    || !expectedDeleted.equals(metadata.deleted)) {
+            if (!expectedIncluded.equals(inspection.metadata.included)
+                    || !expectedDeleted.equals(inspection.metadata.deleted)) {
                 throw chainError("Archive delta metadata differs from catalog: "
                     + version.getId());
             }
+    }
+
+    private static final class ArchiveInspection {
+        private final SnapshotManifest manifest;
+        private final ArchiveMetadata metadata;
+        private ArchiveInspection(SnapshotManifest manifest, ArchiveMetadata metadata) {
+            this.manifest = manifest;
+            this.metadata = metadata;
         }
+    }
+
+    public static final class AvailabilityReport {
+        private final Map<String, String> errorKeys;
+        private final int validatedArchiveCount;
+        private AvailabilityReport(Map<String, String> errorKeys, int validatedArchiveCount) {
+            this.errorKeys = Collections.unmodifiableMap(new HashMap<>(errorKeys));
+            this.validatedArchiveCount = validatedArchiveCount;
+        }
+        public String getErrorKey(String versionId) { return errorKeys.get(versionId); }
+        public Map<String, String> getErrorKeys() { return errorKeys; }
+        public int getValidatedArchiveCount() { return validatedArchiveCount; }
     }
 
     private static ArchiveMetadata readArchiveMetadata(Path archive) throws BackupException {

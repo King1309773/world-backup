@@ -32,6 +32,7 @@ public final class GuiRestoreConfirm extends GuiScreen {
     }
 
     @Override public void initGui() {
+        buttonList.clear();
         buttonList.add(new GuiButton(0, width / 2 - 102, height / 2 + 38, 100, 20,
             I18n.format("gui.worldbackup.confirm")));
         buttonList.add(new GuiButton(1, width / 2 + 2, height / 2 + 38, 100, 20,
@@ -43,11 +44,14 @@ public final class GuiRestoreConfirm extends GuiScreen {
 
     private void updateButtons() {
         if (buttonList.isEmpty()) return;
+        boolean restoring = coordinator.isRestoreActive();
         buttonList.get(0).enabled = mc.world == null && mc.getIntegratedServer() == null
             && !coordinator.isBusy();
+        buttonList.get(1).enabled = !restoring;
     }
 
     @Override protected void actionPerformed(GuiButton button) throws IOException {
+        if (coordinator.isRestoreActive()) return;
         if (button.id == 1) {
             mc.displayGuiScreen(manager);
             return;
@@ -65,11 +69,21 @@ public final class GuiRestoreConfirm extends GuiScreen {
                     repository, version.getId());
             },
             new BackupCoordinator.RestoreCallback() {
-                @Override public void succeeded(Path restored) { manager.restoreSucceeded(); }
-                @Override public void failed(Throwable failure) { manager.restoreFailed(failure); }
+                @Override public void succeeded(Path restored) {
+                    mc.displayGuiScreen(manager);
+                    manager.restoreSucceeded();
+                }
+                @Override public void failed(Throwable failure) {
+                    mc.displayGuiScreen(manager);
+                    manager.restoreFailed(failure);
+                }
             });
         if (!accepted) manager.setStatus("worldbackup.message.busy");
-        mc.displayGuiScreen(manager);
+        updateButtons();
+    }
+
+    @Override protected void keyTyped(char typedChar, int keyCode) throws IOException {
+        if (!coordinator.isRestoreActive()) super.keyTyped(typedChar, keyCode);
     }
 
     @Override public void drawScreen(int mouseX, int mouseY, float partialTicks) {
@@ -81,6 +95,11 @@ public final class GuiRestoreConfirm extends GuiScreen {
             worldFolder, time), width / 2, height / 2 - 25, 0xDDDDDD);
         drawCenteredString(fontRenderer, I18n.format("gui.worldbackup.confirm_restore.safety"),
             width / 2, height / 2 - 10, 0xFFCC66);
+        if (coordinator.isRestoreActive()) {
+            drawCenteredString(fontRenderer,
+                I18n.format("gui.worldbackup.status.restore_in_progress"),
+                width / 2, height / 2 + 18, 0xFFCC66);
+        }
         updateButtons();
         super.drawScreen(mouseX, mouseY, partialTicks);
     }

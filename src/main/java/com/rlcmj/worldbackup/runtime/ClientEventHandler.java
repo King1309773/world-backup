@@ -12,6 +12,7 @@ import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.server.integrated.IntegratedServer;
 import net.minecraftforge.fml.client.registry.ClientRegistry;
 import net.minecraftforge.client.event.GuiScreenEvent;
+import net.minecraftforge.client.event.GuiOpenEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import org.lwjgl.input.Keyboard;
@@ -36,6 +37,7 @@ public final class ClientEventHandler {
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.END) return;
+        coordinator.retryClientCallbacks();
         Minecraft minecraft = Minecraft.getMinecraft();
         IntegratedServer server = minecraft.getIntegratedServer();
         boolean loaded = server != null && minecraft.world != null;
@@ -66,6 +68,11 @@ public final class ClientEventHandler {
     public void onWorldSelectionDraw(GuiScreenEvent.DrawScreenEvent.Pre event) {
         if (!(event.getGui() instanceof GuiWorldSelection)) return;
         GuiWorldSelection screen = (GuiWorldSelection) event.getGui();
+        if (coordinator.isRestoreActive()) {
+            GuiButton manager = managerButtons.get(screen);
+            if (manager != null) manager.enabled = false;
+            return;
+        }
         GuiButton button = managerButtons.get(screen);
         if (button != null) button.enabled = selected(screen) != null;
     }
@@ -73,11 +80,56 @@ public final class ClientEventHandler {
     @SubscribeEvent
     public void onWorldSelectionAction(GuiScreenEvent.ActionPerformedEvent.Post event) {
         if (!(event.getGui() instanceof GuiWorldSelection)
-                || event.getButton().id != MANAGE_BACKUPS) return;
+                || event.getButton().id != MANAGE_BACKUPS
+                || coordinator.isRestoreActive()) return;
         GuiListWorldSelectionEntry entry = selected((GuiWorldSelection) event.getGui());
         if (entry != null) {
             Minecraft.getMinecraft().displayGuiScreen(new GuiBackupManager(event.getGui(),
                 entry.worldSummary.getFileName(), coordinator));
+        }
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionDrawNotice(GuiScreenEvent.DrawScreenEvent.Post event) {
+        if (!(event.getGui() instanceof GuiWorldSelection)
+                || !coordinator.isRestoreActive()) return;
+        GuiWorldSelection screen = (GuiWorldSelection) event.getGui();
+        String message = I18n.format("gui.worldbackup.status.restore_in_progress");
+        Minecraft minecraft = Minecraft.getMinecraft();
+        minecraft.fontRenderer.drawString(message,
+            (screen.width - minecraft.fontRenderer.getStringWidth(message)) / 2,
+            12, 0xFFCC66);
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionActionPre(GuiScreenEvent.ActionPerformedEvent.Pre event) {
+        if (RestoreUiGuard.blocks(coordinator.isRestoreActive(),
+                event.getGui() instanceof GuiWorldSelection)) {
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionMouse(GuiScreenEvent.MouseInputEvent.Pre event) {
+        if (RestoreUiGuard.blocks(coordinator.isRestoreActive(),
+                event.getGui() instanceof GuiWorldSelection)) {
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
+    public void onWorldSelectionKeyboard(GuiScreenEvent.KeyboardInputEvent.Pre event) {
+        if (RestoreUiGuard.blocks(coordinator.isRestoreActive(),
+                event.getGui() instanceof GuiWorldSelection)) {
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
+    public void onGuiOpen(GuiOpenEvent event) {
+        if (RestoreUiGuard.blocks(coordinator.isRestoreActive(),
+                event.getGui() instanceof GuiWorldSelection)) {
+            event.setCanceled(true);
         }
     }
 
@@ -112,6 +164,12 @@ public final class ClientEventHandler {
         private static long saturatingAdd(long value, long increment) {
             if (increment > 0L && value > Long.MAX_VALUE - increment) return Long.MAX_VALUE;
             return value + increment;
+        }
+    }
+
+    static final class RestoreUiGuard {
+        static boolean blocks(boolean restoreActive, boolean worldSelection) {
+            return restoreActive && worldSelection;
         }
     }
 }

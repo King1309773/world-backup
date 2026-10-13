@@ -21,6 +21,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -162,7 +163,7 @@ public class BackupCoordinatorTest {
         assertEquals(1L, runtime.backupEntered.getCount());
 
         runtime.stagingRelease.countDown();
-        await(() -> !coordinator.isActive());
+        await(() -> !coordinator.isActive() && runtime.messages.size() >= 2);
         assertEquals(1, runtime.cleanupSnapshotCount);
         assertEquals("worldbackup.error.timeout",
             runtime.messages.get(runtime.messages.size() - 1));
@@ -520,6 +521,41 @@ public class BackupCoordinatorTest {
         runtime.backupRelease.countDown();
     }
 
+    @Test
+    public void failedClientSchedulingQueuesRestoreCallbackUntilClientTickRetriesIt()
+            throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.failClientSchedule = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executors.add(executor);
+        BackupCoordinator coordinator = new BackupCoordinator(runtime, executor,
+            new ManualWatchdog(), System::nanoTime, TimeUnit.MINUTES.toNanos(30),
+            TimeUnit.SECONDS.toNanos(2));
+        AtomicReference<Thread> callbackThread = new AtomicReference<>();
+        CountDownLatch operationFinished = new CountDownLatch(1);
+
+        assertTrue(coordinator.requestRestore(() -> {
+            operationFinished.countDown();
+            return Paths.get("restored");
+        }, new BackupCoordinator.RestoreCallback() {
+            @Override public void succeeded(java.nio.file.Path restored) {
+                callbackThread.set(Thread.currentThread());
+            }
+            @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
+        }));
+        assertTrue(operationFinished.await(2, TimeUnit.SECONDS));
+        await(() -> runtime.clientScheduleAttempts > 0);
+
+        assertTrue(coordinator.isRestoreActive());
+        assertEquals(null, callbackThread.get());
+        runtime.failClientSchedule = false;
+        Thread clientThread = Thread.currentThread();
+        coordinator.retryClientCallbacks();
+
+        assertEquals(clientThread, callbackThread.get());
+        assertFalse(coordinator.isRestoreActive());
+    }
+
     private BackupCoordinator coordinator(FakeRuntime runtime, ManualWatchdog watchdog) {
         return coordinator(runtime, watchdog, System::nanoTime);
     }
@@ -653,10 +689,12 @@ public class BackupCoordinatorTest {
         private volatile boolean blockPrepareUntilInterrupted;
         private volatile boolean returnFromPrepareWithInterruptSet;
         private volatile boolean failPrepareOnExternalInterrupt;
+        private volatile boolean failClientSchedule;
         private volatile boolean prepareFlagsRestored;
         private volatile Runnable deferredSchedule;
         private volatile int cleanupFailuresRemaining;
         private volatile int schedules;
+        private volatile int clientScheduleAttempts;
         private volatile int freezeCount;
         private volatile int unfreezeCount;
         private volatile int releaseWorldsCount;
@@ -777,6 +815,11 @@ public class BackupCoordinatorTest {
                 deferredSchedule = command;
                 return;
             }
+            command.run();
+        }
+        @Override public void scheduleClient(Runnable command) {
+            clientScheduleAttempts++;
+            if (failClientSchedule) throw new IllegalStateException("client unavailable");
             command.run();
         }
         private void runDeferredSchedule() {
