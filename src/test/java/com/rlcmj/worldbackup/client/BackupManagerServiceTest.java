@@ -1,6 +1,7 @@
 package com.rlcmj.worldbackup.client;
 
 import com.rlcmj.worldbackup.core.BackupCatalog;
+import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupMode;
 import com.rlcmj.worldbackup.core.BackupTrigger;
 import com.rlcmj.worldbackup.core.BackupVersion;
@@ -10,8 +11,11 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collections;
 
@@ -99,6 +103,54 @@ public class BackupManagerServiceTest {
     public void backgroundCatalogMemoryFailureUsesSafeLocalizedMessage() {
         assertEquals("worldbackup.error.catalog_too_large",
             GuiBackupManager.errorKey(new OutOfMemoryError("catalog")));
+    }
+
+    @Test
+    public void localizedBackupFailurePreservesRecoveryPathArgument() {
+        Path recovery = temp.getRoot().toPath().resolve("restore-safety/World-1");
+        BackupException failure = new BackupException(
+            "worldbackup.error.restore_rollback", new IOException("rollback failed"),
+            recovery.toString());
+
+        String formatted = BackupErrorFormatter.format(failure,
+            (key, arguments) -> key + "|" + arguments[0]);
+
+        assertEquals("worldbackup.error.restore_rollback|" + recovery, formatted);
+        assertEquals(recovery.toString(), BackupErrorFormatter.arguments(failure)[0]);
+        assertEquals(recovery.toString(), GuiBackupManager.errorArguments(failure)[0]);
+    }
+
+    @Test
+    public void rollbackWithoutVerifiedRecoveryPathUsesSafeFallbackMessage() {
+        BackupException failure = new BackupException(
+            "worldbackup.error.restore_rollback", new IOException("rollback failed"));
+
+        assertEquals("worldbackup.error.restore_rollback_unknown",
+            BackupErrorFormatter.format(failure, (key, arguments) -> key));
+    }
+
+    @Test
+    public void languageFilesDescribeReservedPathRollbackRecoveryAndConfirmationOrder()
+            throws Exception {
+        for (String language : new String[] { "en_us.lang", "zh_cn.lang" }) {
+            String text = new String(Files.readAllBytes(Paths.get(
+                "src/main/resources/assets/worldbackup/lang/" + language)),
+                StandardCharsets.UTF_8);
+            assertTrue(text.contains("worldbackup.error.backup_path_reserved="));
+            assertTrue(text.matches("(?s).*worldbackup\\.error\\.restore_rollback=[^\\r\\n]*%s.*"));
+            assertTrue(text.matches("(?s).*gui\\.worldbackup\\.confirm_restore\\.message="
+                + "[^\\r\\n]*%s[^\\r\\n]*%s.*"));
+        }
+    }
+
+    @Test
+    public void restoreConfirmationFormatsTimeBeforeWorldFolder() {
+        String formatted = RestoreConfirmationFormatter.format("2026-10-14 10:30",
+            "MyWorld", (key, arguments) -> key + "|" + arguments[0] + "|"
+                + arguments[1]);
+
+        assertEquals("gui.worldbackup.confirm_restore.message|2026-10-14 10:30|MyWorld",
+            formatted);
     }
 
     @Test

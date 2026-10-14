@@ -852,8 +852,15 @@ public final class BackupCoordinator {
         @Override public Object stageSnapshot(Object prepared,
                                               BackupCancellation cancellation)
                 throws Exception {
-            return snapshots.stage((WorldSnapshotController.Prepared) prepared,
-                cancellation);
+            WorldSnapshotController.Prepared snapshot =
+                (WorldSnapshotController.Prepared) prepared;
+            Path game = Minecraft.getMinecraft().gameDir.toPath();
+            Path sourceWorld = snapshot.getSourceWorldDirectory();
+            ConfigSnapshot config = ConfigSnapshot.capture(game, sourceWorld);
+            Path repositoryPath = config.getBackupRoot().resolve(
+                sourceWorld.getFileName().toString());
+            return snapshots.stage(snapshot, cancellation,
+                java.util.Collections.singleton(repositoryPath));
         }
         @Override public void releasePrepared(Object prepared) throws Exception {
             snapshots.releaseWorlds((WorldSnapshotController.Prepared) prepared);
@@ -868,7 +875,7 @@ public final class BackupCoordinator {
             snapshots.cleanup((WorldSnapshotController.Handle) snapshot);
         }
         @Override public BackupJob createJob(Object server, Object snapshot,
-                                             BackupTrigger trigger) {
+                                             BackupTrigger trigger) throws Exception {
             MinecraftServer minecraftServer = (MinecraftServer) server;
             WorldSnapshotController.Handle handle =
                 (WorldSnapshotController.Handle) snapshot;
@@ -877,7 +884,15 @@ public final class BackupCoordinator {
             ConfigSnapshot config = ConfigSnapshot.capture(
                 Minecraft.getMinecraft().gameDir.toPath(), sourceWorld);
             String worldId = sourceWorld.getFileName().toString();
-            return new BackupJob(worldRoot, config.getBackupRoot().resolve(worldId),
+            Path repositoryPath = config.getBackupRoot().resolve(worldId);
+            Path stagingRoot = Minecraft.getMinecraft().gameDir.toPath()
+                .resolve(".worldbackup-staging");
+            if (com.rlcmj.worldbackup.core.PathRelations.overlaps(repositoryPath,
+                    stagingRoot)) {
+                throw new BackupException("worldbackup.error.backup_path_reserved",
+                    repositoryPath.toString());
+            }
+            return new BackupJob(worldRoot, repositoryPath,
                 worldId, minecraftServer.getWorldName(), config.getMode(), trigger,
                 config.getMaxVersions(), config.getIncrementsPerBase(),
                 System.currentTimeMillis());

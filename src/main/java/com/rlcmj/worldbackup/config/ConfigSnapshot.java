@@ -1,6 +1,8 @@
 package com.rlcmj.worldbackup.config;
 
 import com.rlcmj.worldbackup.core.BackupMode;
+import com.rlcmj.worldbackup.core.BackupException;
+import com.rlcmj.worldbackup.core.PathRelations;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -35,11 +37,12 @@ public final class ConfigSnapshot {
         this.backupRoot = Objects.requireNonNull(backupRoot, "backupRoot");
     }
 
-    public static ConfigSnapshot capture(Path gameDir) {
+    public static ConfigSnapshot capture(Path gameDir) throws BackupException {
         return capture(gameDir, null);
     }
 
-    public static ConfigSnapshot capture(Path gameDir, Path activeWorldRoot) {
+    public static ConfigSnapshot capture(Path gameDir, Path activeWorldRoot)
+            throws BackupException {
         Path normalizedGameDir = absolute(gameDir, "gameDir");
         String configuredPath = WorldBackupConfig.backupPath;
         if (configuredPath == null || configuredPath.trim().isEmpty()) {
@@ -61,6 +64,16 @@ public final class ConfigSnapshot {
         if (relative && !resolveExistingSegments(backupRoot)
                 .startsWith(resolveExistingSegments(normalizedGameDir))) {
             throw new IllegalArgumentException("relative backupPath must remain below gameDir");
+        }
+        Path reservedStaging = normalizedGameDir.resolve(".worldbackup-staging");
+        try {
+            if (PathRelations.overlaps(backupRoot, reservedStaging)) {
+                throw new BackupException("worldbackup.error.backup_path_reserved",
+                    backupRoot.toString());
+            }
+        } catch (IOException | RuntimeException invalidPath) {
+            throw new BackupException("worldbackup.error.backup_path_reserved",
+                invalidPath, backupRoot.toString());
         }
 
         ConfigSnapshot snapshot = new ConfigSnapshot(

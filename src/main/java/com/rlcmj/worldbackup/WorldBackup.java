@@ -11,6 +11,8 @@ import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLServerStoppingEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.client.event.ConfigChangedEvent;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 @Mod(
     modid = WorldBackup.MOD_ID,
@@ -24,6 +26,7 @@ public final class WorldBackup {
     public static final String MOD_ID = "worldbackup";
     public static final String NAME = "World Backup";
     public static final String VERSION = "1.0.0";
+    public static final Logger LOGGER = LogManager.getLogger(NAME);
     private final BackupCoordinator backupCoordinator = new BackupCoordinator();
 
     @Mod.EventHandler

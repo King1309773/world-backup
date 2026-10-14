@@ -91,8 +91,9 @@ public final class GuiRestoreConfirm extends GuiScreen {
         drawCenteredString(fontRenderer, I18n.format("gui.worldbackup.confirm_restore.title"),
             width / 2, height / 2 - 55, 0xFFFFFF);
         String time = DateFormat.getDateTimeInstance().format(new Date(version.getCreatedAt()));
-        drawCenteredString(fontRenderer, I18n.format("gui.worldbackup.confirm_restore.message",
-            worldFolder, time), width / 2, height / 2 - 25, 0xDDDDDD);
+        drawCenteredString(fontRenderer, RestoreConfirmationFormatter.format(time,
+            worldFolder, (key, arguments) -> I18n.format(key, arguments)),
+            width / 2, height / 2 - 25, 0xDDDDDD);
         drawCenteredString(fontRenderer, I18n.format("gui.worldbackup.confirm_restore.safety"),
             width / 2, height / 2 - 10, 0xFFCC66);
         if (coordinator.isRestoreActive()) {

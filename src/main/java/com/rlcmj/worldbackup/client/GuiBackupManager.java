@@ -1,8 +1,8 @@
 package com.rlcmj.worldbackup.client;
 
+import com.rlcmj.worldbackup.WorldBackup;
 import com.rlcmj.worldbackup.config.ConfigSnapshot;
 import com.rlcmj.worldbackup.core.BackupCatalog;
-import com.rlcmj.worldbackup.core.BackupException;
 import com.rlcmj.worldbackup.core.BackupVersion;
 import com.rlcmj.worldbackup.runtime.BackupCoordinator;
 import com.rlcmj.worldbackup.storage.BackupRestorer;
@@ -163,8 +163,8 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
 
                 @Override public void failed(Throwable failure) {
                     if (!screenActive || requestedSafetyMode != safetyMode) return;
-                    statusKey = errorKey(failure);
-                    statusArguments = new Object[0];
+                    statusKey = BackupErrorFormatter.key(failure);
+                    statusArguments = BackupErrorFormatter.arguments(failure);
                     updateButtons();
                 }
             });
@@ -296,7 +296,8 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
             }
             @Override public void failed(Throwable failure) {
                 if (!screenActive) return;
-                startLoad(false, errorKey(failure), new Object[0]);
+                startLoad(false, BackupErrorFormatter.key(failure),
+                    BackupErrorFormatter.arguments(failure));
             }
         };
     }
@@ -312,8 +313,14 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
 
     void restoreFailed(Throwable failure) {
+        Object[] arguments = errorArguments(failure);
+        Object recoveryPath = "worldbackup.error.restore_rollback".equals(errorKey(failure))
+            && arguments.length > 0 ? arguments[0] : "<not confirmed>";
+        WorldBackup.LOGGER.error("World restore failed; verified recovery path: {}",
+            recoveryPath, failure);
         startLoad(true, "worldbackup.message.restore_failure",
-            new Object[] { I18n.format(errorKey(failure)) });
+            new Object[] { BackupErrorFormatter.format(failure,
+                (key, values) -> I18n.format(key, values)) });
     }
 
     void setStatus(String key, Object... arguments) {
@@ -431,17 +438,10 @@ public final class GuiBackupManager extends GuiScreen implements GuiYesNoCallbac
     }
     static boolean managerNavigationEnabled(boolean busy) { return !busy; }
     static String errorKey(Throwable failure) {
-        Throwable cursor = failure;
-        while (cursor != null) {
-            if (cursor instanceof OutOfMemoryError) {
-                return "worldbackup.error.catalog_too_large";
-            }
-            if (cursor instanceof BackupException) {
-                return ((BackupException) cursor).getTranslationKey();
-            }
-            cursor = cursor.getCause();
-        }
-        return "worldbackup.error.restore_swap";
+        return BackupErrorFormatter.key(failure);
+    }
+    static Object[] errorArguments(Throwable failure) {
+        return BackupErrorFormatter.arguments(failure);
     }
     private static final class Entry {
         private final BackupVersion version;

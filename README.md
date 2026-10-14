@@ -33,6 +33,10 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 | `incrementsPerBase` | `5` | 每个基线最多连续创建的增量数，最小为 1 |
 | `backupPath` | `backups` | 相对游戏目录或绝对路径；修改后不会搬迁已有备份 |
 
+`<游戏目录>/.worldbackup-staging` 是模组保留的内部临时目录。`backupPath`
+不得等于该目录、位于该目录中，也不得是包含该目录的祖先目录；路径校验会尽力解析已存在的
+符号链接或 Windows junction 后再判断。默认的 `<游戏目录>/backups` 不受影响。
+
 “创建手动备份”按键默认未绑定。进入“选项 → 控制”，在“世界备份”分类中为它绑定按键。按键只在已加载的单人世界中生效，并受 `enabled` 总开关控制。
 
 ## 备份格式与保留策略
@@ -49,7 +53,7 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 
 每个 ZIP 内有 `manifest.json`，文件内容位于 `data/<世界内相对路径>`。全量基线使用 `-full.zip`，增量使用 `-delta.zip`，覆写模式使用 `-latest.zip`。索引记录触发来源、父版本、基线、快照清单、变更和删除路径。
 
-智能增量会比较文件大小、修改时间和 SHA-256；内容未变的文件不会重复写入增量包。达到 `incrementsPerBase` 后自动创建新的全量基线。Minecraft region 文件（`.mca`）按普通文件处理：只要内容变化，就把整个 `.mca` 写入归档，不进行区块级差分。
+智能增量会比较文件大小、修改时间和 SHA-256；内容未变的文件不会重复写入增量包。为避免每次备份都重新读取并散列整个世界，扫描器在文件大小和修改时间都与上一份清单相同时会复用历史 SHA-256。若外部工具改写了文件内容、同时刻意保留相同大小和相同修改时间，该变化可能无法被识别；对这类工具处理过的世界，应先创建新的全量基线或确保修改时间发生变化。达到 `incrementsPerBase` 后自动创建新的全量基线。Minecraft region 文件（`.mca`）按普通文件处理：只要内容变化，就把整个 `.mca` 写入归档，不进行区块级差分。
 
 `maxVersions` 限制的是 `visible=true` 的可选恢复点数量。为保证仍可见的增量版本可恢复，其依赖的旧基线或中间增量可能以 `visible=false` 留在索引和磁盘中；这些 hidden dependencies 不占可见版本配额，也不会单独显示在管理界面。删除恢复点时会重新计算依赖，只清理由任何保留恢复点都不再需要的归档。
 
@@ -78,14 +82,16 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 - `.worldbackup-staging/snapshot-*`：一致性复制目录；启动下一次 staging 时会清理可安全识别的孤儿目录。不要在游戏或备份仍运行时手动删除。
 - `restore-safety/.deleting-*`：安全副本删除中途失败后可能留下的隔离目录。它不会作为普通安全副本显示，应先关闭游戏并人工核对内容后处理。
 
+若恢复交换与自动回滚同时失败，管理界面会显示已经过校验、可用于灾难恢复的具体路径，日志中也会记录技术异常与该路径。此时应立即关闭游戏，不要再次进入或改动该世界；先完整复制界面给出的目录及 `saves/<世界文件夹>`、`restore-safety/<世界文件夹>-*`，再依据日志判断应恢复哪一份。若界面提示无法确认安全恢复路径，则不要猜测或覆盖现有文件，应保留上述目录并人工检查日志。
+
 ## 验证状态
 
 ### Automated verified
 
-- 2026-10-13：使用项目内 Temurin OpenJDK `1.8.0_504`，带 TLS 1.2/IPv4 兼容参数执行 `clean test build --offline --no-daemon --max-workers=1` 成功。
-- JUnit：16 个测试套件，273 个测试，0 failure，0 error，1 个平台条件测试 skipped。
+- 2026-10-14：使用项目内 Temurin OpenJDK `1.8.0_504` 执行 `clean test build --offline --no-daemon --max-workers=1` 成功。
+- JUnit：16 个测试套件，282 个测试，0 failure，0 error，1 个平台条件测试 skipped。
 - `worldbackup-1.0.0.jar` 已核对包含 `mcmod.info`、`WorldBackup.class`、`zh_cn.lang`、`en_us.lang`、`META-INF/worldbackup_at.cfg`、GUI 与 runtime 类；没有测试 class，也未扫描到邮箱或绝对本机路径。
-- 自动化测试覆盖配置快照、定时/退出/手动协调、全量/增量/覆写创建、增量链和基线轮换、visible/hidden 保留依赖、归档校验、截断/损坏不可用、恢复交换与安全副本、删除和路径安全等核心行为。它们不是实际 UI 操作的替代品。
+- 自动化测试覆盖配置快照、内部 staging 保留区与仓库防误删、定时/退出/手动协调、全量/增量/覆写创建、增量链和基线轮换、visible/hidden 保留依赖、归档校验、截断/损坏不可用、恢复交换与安全副本、回滚恢复路径诊断、删除和路径安全等核心行为。它们不是实际 UI 操作的替代品。
 
 ### Manual pending
 

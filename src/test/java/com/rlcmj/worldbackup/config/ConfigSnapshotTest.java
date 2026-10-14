@@ -1,6 +1,7 @@
 package com.rlcmj.worldbackup.config;
 
 import com.rlcmj.worldbackup.core.BackupMode;
+import com.rlcmj.worldbackup.core.BackupException;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -33,7 +34,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void capturesExactDefaults() throws IOException {
+    public void capturesExactDefaults() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
 
         ConfigSnapshot snapshot = ConfigSnapshot.capture(gameDir);
@@ -50,7 +51,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void clampsAllIntegerSettingsToAtLeastOne() throws IOException {
+    public void clampsAllIntegerSettingsToAtLeastOne() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
         WorldBackupConfig.intervalMinutes = 0;
         WorldBackupConfig.maxVersions = -10;
@@ -64,7 +65,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void resolvesRelativePathBelowGameDirectory() throws IOException {
+    public void resolvesRelativePathBelowGameDirectory() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
         WorldBackupConfig.backupPath = "custom/../archives";
 
@@ -78,7 +79,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void normalizesAbsolutePath() throws IOException {
+    public void normalizesAbsolutePath() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
         Path external = temporaryFolder.newFolder("external").toPath();
         WorldBackupConfig.backupPath = external.resolve("unused/../archives").toString();
@@ -90,7 +91,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void rejectsEitherDirectionOfWorldContainment() throws IOException {
+    public void rejectsEitherDirectionOfWorldContainment() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
         Path world = Files.createDirectories(gameDir.resolve("saves/world"));
 
@@ -109,7 +110,7 @@ public class ConfigSnapshotTest {
     }
 
     @Test
-    public void resolvesExistingSymlinkSegmentsBeforeContainmentChecks() throws IOException {
+    public void resolvesExistingSymlinkSegmentsBeforeContainmentChecks() throws Exception {
         Path gameDir = temporaryFolder.newFolder("game").toPath();
         Path world = Files.createDirectories(gameDir.resolve("saves/world"));
         Path link = gameDir.resolve("linked-backups");
@@ -122,5 +123,50 @@ public class ConfigSnapshotTest {
 
         assertThrows(IllegalArgumentException.class,
             () -> ConfigSnapshot.capture(gameDir, world));
+    }
+
+    @Test
+    public void rejectsReservedStagingRootAndDescendants() throws Exception {
+        Path gameDir = temporaryFolder.newFolder("game-reserved").toPath();
+        Path staging = Files.createDirectories(gameDir.resolve(".worldbackup-staging"));
+
+        for (Path reserved : new Path[] { staging, staging.resolve("snapshot-backups") }) {
+            WorldBackupConfig.backupPath = reserved.toString();
+            BackupException failure = assertThrows(BackupException.class,
+                () -> ConfigSnapshot.capture(gameDir));
+            assertEquals("worldbackup.error.backup_path_reserved",
+                failure.getTranslationKey());
+        }
+    }
+
+    @Test
+    public void rejectsBackupRootThatContainsReservedStagingRoot() throws Exception {
+        Path gameDir = temporaryFolder.newFolder("game-reserved-ancestor").toPath();
+        WorldBackupConfig.backupPath = gameDir.toString();
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> ConfigSnapshot.capture(gameDir));
+
+        assertEquals("worldbackup.error.backup_path_reserved",
+            failure.getTranslationKey());
+    }
+
+    @Test
+    public void rejectsReservedStagingAliasThroughExistingSymlink() throws Exception {
+        Path gameDir = temporaryFolder.newFolder("game-reserved-link").toPath();
+        Path staging = Files.createDirectories(gameDir.resolve(".worldbackup-staging"));
+        Path link = gameDir.resolve("staging-alias");
+        try {
+            Files.createSymbolicLink(link, staging);
+        } catch (UnsupportedOperationException | IOException | SecurityException unavailable) {
+            assumeNoException(unavailable);
+        }
+        WorldBackupConfig.backupPath = link.resolve("snapshot-backups").toString();
+
+        BackupException failure = assertThrows(BackupException.class,
+            () -> ConfigSnapshot.capture(gameDir));
+
+        assertEquals("worldbackup.error.backup_path_reserved",
+            failure.getTranslationKey());
     }
 }

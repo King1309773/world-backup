@@ -1,6 +1,7 @@
 package com.rlcmj.worldbackup.runtime;
 
 import com.rlcmj.worldbackup.core.BackupCancellation;
+import com.rlcmj.worldbackup.core.PathRelations;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.WorldServer;
 import net.minecraft.world.storage.ISaveHandler;
@@ -139,9 +140,17 @@ public final class WorldSnapshotController {
 
     public Handle stage(Prepared prepared, BackupCancellation cancellation)
             throws Exception {
+        return stage(prepared, cancellation, Collections.<Path>emptySet());
+    }
+
+    Handle stage(Prepared prepared, BackupCancellation cancellation,
+                 Set<Path> protectedPaths) throws Exception {
         Objects.requireNonNull(prepared, "prepared");
         Objects.requireNonNull(cancellation, "cancellation").check();
-        StagedSnapshot staged = stager.stage(prepared.sourceWorldDirectory, cancellation);
+        StagedSnapshot staged = stager instanceof NioSnapshotStager
+            ? ((NioSnapshotStager) stager).stage(prepared.sourceWorldDirectory,
+                cancellation, protectedPaths)
+            : stager.stage(prepared.sourceWorldDirectory, cancellation);
         try {
             cancellation.check();
             return new Handle(prepared, staged);
@@ -264,6 +273,10 @@ public final class WorldSnapshotController {
             this.sourceWorldDirectory = Objects.requireNonNull(sourceWorldDirectory,
                 "sourceWorldDirectory").toAbsolutePath().normalize();
             this.states = new ArrayList<>(states);
+        }
+
+        Path getSourceWorldDirectory() {
+            return sourceWorldDirectory;
         }
     }
 
@@ -478,6 +491,25 @@ public final class WorldSnapshotController {
                 }
                 throw failure;
             }
+        }
+
+        StagedSnapshot stage(Path source, BackupCancellation cancellation,
+                             Set<Path> protectedPaths) throws IOException {
+            Objects.requireNonNull(protectedPaths, "protectedPaths");
+            for (Path protectedPath : protectedPaths) {
+                try {
+                    if (PathRelations.overlaps(stagingBase,
+                            Objects.requireNonNull(protectedPath, "protectedPath"))) {
+                        throw new IOException("Snapshot staging directory overlaps protected path: "
+                            + protectedPath);
+                    }
+                } catch (IOException failure) {
+                    throw failure;
+                } catch (RuntimeException failure) {
+                    throw new IOException("Unable to validate protected snapshot path", failure);
+                }
+            }
+            return stage(source, cancellation);
         }
 
         private static SnapshotPlan inspectTree(Path source,

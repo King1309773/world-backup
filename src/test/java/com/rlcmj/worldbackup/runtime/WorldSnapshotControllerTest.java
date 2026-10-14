@@ -72,6 +72,39 @@ public class WorldSnapshotControllerTest {
     }
 
     @Test
+    public void stagingRejectsProtectedRepositoryBeforeOrphanSweep() throws Exception {
+        Path game = temporaryFolder.newFolder("game-protected-repo").toPath();
+        Path world = Files.createDirectories(game.resolve("saves/world"));
+        Files.write(world.resolve("level.dat"), new byte[] {1});
+        Path stagingBase = Files.createDirectories(game.resolve(".worldbackup-staging"));
+        Path repository = Files.createDirectories(stagingBase.resolve("snapshot-backups"));
+        Path canary = Files.write(repository.resolve("keep.dat"), new byte[] {9});
+
+        IOException failure = assertThrows(IOException.class,
+            () -> new WorldSnapshotController.NioSnapshotStager(stagingBase)
+                .stage(world, new BackupCancellation(),
+                    java.util.Collections.singleton(repository)));
+
+        assertTrue(failure.getMessage().contains("protected"));
+        assertTrue(Files.exists(canary));
+        assertEquals(9, Files.readAllBytes(canary)[0]);
+    }
+
+    @Test
+    public void stagingRejectsProtectedRepositoryContainingStagingRoot() throws Exception {
+        Path game = temporaryFolder.newFolder("game-protected-ancestor").toPath();
+        Path world = Files.createDirectories(game.resolve("saves/world"));
+        Files.write(world.resolve("level.dat"), new byte[] {1});
+        Path stagingBase = game.resolve(".worldbackup-staging");
+
+        assertThrows(IOException.class,
+            () -> new WorldSnapshotController.NioSnapshotStager(stagingBase)
+                .stage(world, new BackupCancellation(),
+                    java.util.Collections.singleton(game)));
+        assertFalse(Files.exists(stagingBase));
+    }
+
+    @Test
     public void realNioStagingRefusesBaseInsideWorldWithoutCreatingIt() throws Exception {
         Path game = temporaryFolder.newFolder("game-overlap").toPath();
         Path world = Files.createDirectories(game.resolve("saves/world"));
