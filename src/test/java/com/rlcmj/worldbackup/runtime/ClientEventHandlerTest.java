@@ -8,6 +8,98 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class ClientEventHandlerTest {
+    private static final long WORLD_LOAD_DELAY_NANOS = TimeUnit.SECONDS.toNanos(10L);
+
+    @Test
+    public void worldLoadWaitsTenSecondsAndFiresOnceAfterAcceptance() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, 0L));
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS - 1L));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS));
+        timer.accepted(server);
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS + 1L));
+    }
+
+    @Test
+    public void pendingWorldLoadRemainsDueUntilAccepted() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, 0L));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS + 1L));
+        timer.accepted(server);
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS + 2L));
+    }
+
+    @Test
+    public void worldLoadSwitchingServerIdentityStartsANewDelay() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object first = new Object();
+        Object second = new Object();
+
+        assertFalse(timer.due(first, true, 0L));
+        assertTrue(timer.due(first, true, WORLD_LOAD_DELAY_NANOS));
+        assertFalse(timer.due(second, true, WORLD_LOAD_DELAY_NANOS));
+        assertFalse(timer.due(second, true, WORLD_LOAD_DELAY_NANOS * 2L - 1L));
+        assertTrue(timer.due(second, true, WORLD_LOAD_DELAY_NANOS * 2L));
+    }
+
+    @Test
+    public void leavingAndReenteringSameServerStartsANewDelay() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, 0L));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS));
+        assertFalse(timer.due(null, false, WORLD_LOAD_DELAY_NANOS));
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS + 1L));
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS * 2L));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS * 2L + 1L));
+    }
+
+    @Test
+    public void disablingAndReenablingWorldLoadStartsANewDelay() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, 0L));
+        assertFalse(timer.due(server, false, WORLD_LOAD_DELAY_NANOS));
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS + 1L));
+        assertFalse(timer.due(server, true, WORLD_LOAD_DELAY_NANOS * 2L));
+        assertTrue(timer.due(server, true, WORLD_LOAD_DELAY_NANOS * 2L + 1L));
+    }
+
+    @Test
+    public void worldLoadDeadlineSaturatesOnOverflow() {
+        ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
+        Object server = new Object();
+
+        assertFalse(timer.due(server, true, Long.MAX_VALUE - 1L));
+        assertFalse(timer.due(server, true, Long.MAX_VALUE - 1L));
+        assertTrue(timer.due(server, true, Long.MAX_VALUE));
+    }
+
+    @Test
+    public void acceptingWorldLoadDoesNotMoveScheduledDeadline() {
+        ClientEventHandler.WorldLoadTimer worldLoad =
+            new ClientEventHandler.WorldLoadTimer();
+        ClientEventHandler.BackupTimer scheduled = new ClientEventHandler.BackupTimer();
+        Object server = new Object();
+        long scheduledInterval = TimeUnit.SECONDS.toNanos(30L);
+
+        assertFalse(worldLoad.due(server, true, 0L));
+        assertFalse(scheduled.due(server, true, scheduledInterval, 0L));
+        assertTrue(worldLoad.due(server, true, WORLD_LOAD_DELAY_NANOS));
+        worldLoad.accepted(server);
+        assertFalse(scheduled.due(server, true, scheduledInterval,
+            WORLD_LOAD_DELAY_NANOS));
+        assertTrue(scheduled.due(server, true, scheduledInterval,
+            scheduledInterval));
+    }
+
     @Test
     public void timerResetsForWorldIdentityAndOnlyFiresWhenDue() {
         ClientEventHandler.BackupTimer timer = new ClientEventHandler.BackupTimer();

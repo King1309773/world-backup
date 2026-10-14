@@ -68,13 +68,13 @@ public class BackupCoordinatorTest {
     }
 
     @Test
-    public void successMessageUsesMonotonicElapsedTime() throws Exception {
+    public void worldLoadSuccessMessageUsesMonotonicElapsedTime() throws Exception {
         FakeRuntime runtime = new FakeRuntime();
         AtomicLong nanos = new AtomicLong();
         BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog(),
             () -> nanos.getAndAdd(TimeUnit.SECONDS.toNanos(3)));
 
-        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        assertTrue(coordinator.request(new Object(), BackupTrigger.WORLD_LOAD));
         await(() -> !coordinator.isActive() && runtime.messages.size() >= 2);
 
         assertEquals("worldbackup.message.success", runtime.messages.get(1));
@@ -82,16 +82,19 @@ public class BackupCoordinatorTest {
     }
 
     @Test
-    public void workerFailureStillUnfreezesAndCleansSnapshot() throws Exception {
+    public void worldLoadFailureStillReportsElapsedTimeAndCleansSnapshot() throws Exception {
         FakeRuntime runtime = new FakeRuntime();
         runtime.failBackup = true;
-        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        AtomicLong nanos = new AtomicLong();
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog(),
+            () -> nanos.getAndAdd(TimeUnit.SECONDS.toNanos(4)));
 
-        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        assertTrue(coordinator.request(new Object(), BackupTrigger.WORLD_LOAD));
         await(() -> !coordinator.isActive() && runtime.messages.size() >= 2);
 
         assertEquals(1, runtime.unfreezeCount);
         assertEquals("worldbackup.message.failure", runtime.messages.get(1));
+        assertEquals("4.0", runtime.messageArguments.get(1)[0]);
     }
 
     @Test

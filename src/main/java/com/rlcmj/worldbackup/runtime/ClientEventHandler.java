@@ -23,10 +23,12 @@ import java.util.WeakHashMap;
 
 public final class ClientEventHandler {
     private static final int MANAGE_BACKUPS = 0x5742;
+    private static final long WORLD_LOAD_DELAY_NANOS = TimeUnit.SECONDS.toNanos(10L);
     private final BackupCoordinator coordinator;
     private final KeyBinding manualBackup = new KeyBinding("key.worldbackup.manual",
         Keyboard.KEY_NONE, "key.categories.worldbackup");
     private final BackupTimer timer = new BackupTimer();
+    private final WorldLoadTimer worldLoadTimer = new WorldLoadTimer();
     private final Map<GuiWorldSelection, GuiButton> managerButtons = new WeakHashMap<>();
 
     public ClientEventHandler(BackupCoordinator coordinator) {
@@ -45,11 +47,19 @@ public final class ClientEventHandler {
         while (manualBackup.isPressed()) {
             if (loaded) coordinator.request(server, BackupTrigger.MANUAL);
         }
+        boolean worldLoad = loaded && WorldBackupConfig.enabled
+            && WorldBackupConfig.worldLoadEnabled;
+        long now = System.nanoTime();
+        if (worldLoadTimer.due(worldLoad ? server : null, worldLoad, now)
+                && !coordinator.isBusy()
+                && coordinator.request(server, BackupTrigger.WORLD_LOAD)) {
+            worldLoadTimer.accepted(server);
+        }
         boolean scheduled = loaded && WorldBackupConfig.enabled
             && WorldBackupConfig.scheduledEnabled;
         long interval = TimeUnit.MINUTES.toNanos(
             Math.max(1, WorldBackupConfig.intervalMinutes));
-        if (timer.due(scheduled ? server : null, scheduled, interval, System.nanoTime())) {
+        if (timer.due(scheduled ? server : null, scheduled, interval, now)) {
             coordinator.request(server, BackupTrigger.SCHEDULED);
         }
     }
@@ -152,19 +162,47 @@ public final class ClientEventHandler {
             if (server != serverIdentity || !armed || intervalNanos != armedIntervalNanos) {
                 serverIdentity = server;
                 armedIntervalNanos = intervalNanos;
-                nextScheduledNanos = saturatingAdd(now, intervalNanos);
+                nextScheduledNanos = ClientEventHandler.saturatingAdd(now, intervalNanos);
                 armed = true;
                 return false;
             }
             if (now - nextScheduledNanos < 0L) return false;
-            nextScheduledNanos = saturatingAdd(now, intervalNanos);
+            nextScheduledNanos = ClientEventHandler.saturatingAdd(now, intervalNanos);
             return true;
         }
+    }
 
-        private static long saturatingAdd(long value, long increment) {
-            if (increment > 0L && value > Long.MAX_VALUE - increment) return Long.MAX_VALUE;
-            return value + increment;
+    static final class WorldLoadTimer {
+        private Object serverIdentity;
+        private long deadlineNanos;
+        private boolean armed;
+        private boolean accepted;
+
+        boolean due(Object server, boolean enabled, long now) {
+            if (server == null || !enabled) {
+                serverIdentity = null;
+                armed = false;
+                accepted = false;
+                return false;
+            }
+            if (server != serverIdentity || !armed) {
+                serverIdentity = server;
+                deadlineNanos = saturatingAdd(now, WORLD_LOAD_DELAY_NANOS);
+                armed = true;
+                accepted = false;
+                return false;
+            }
+            return !accepted && now - deadlineNanos >= 0L;
         }
+
+        void accepted(Object server) {
+            if (armed && server == serverIdentity) accepted = true;
+        }
+    }
+
+    private static long saturatingAdd(long value, long increment) {
+        if (increment > 0L && value > Long.MAX_VALUE - increment) return Long.MAX_VALUE;
+        return value + increment;
     }
 
     static final class RestoreUiGuard {
