@@ -11,7 +11,7 @@ Add an independently configurable backup that runs once after entering a single-
 - After ten seconds, request exactly one `WORLD_LOAD` backup for that world session.
 - Leaving the world, switching worlds, or replacing the integrated-server instance resets the state. Re-entering a world arms a fresh backup.
 - The master switch disables this trigger. Dedicated servers and screens without a loaded world never arm it.
-- If another backup or maintenance operation is busy at the deadline, retain the pending world-load request and retry on later client ticks. Mark it complete only after the coordinator accepts the request, so a transient busy state does not silently lose the backup.
+- If another backup or maintenance operation is busy at the deadline, retain the pending world-load request and retry on later client ticks after `BackupCoordinator.isBusy()` becomes false. Mark it complete only after the coordinator accepts the request, so a transient busy state does not silently lose the backup without spamming the busy chat message every tick.
 - The existing completion feedback remains authoritative: success shows `备份成功，用时 %s 秒`; failure shows `备份失败（%s 秒）：%s`. The elapsed value is measured with `System.nanoTime()` by the coordinator.
 - Backup Manager displays the new trigger as localized `进入世界` / `World load`.
 
