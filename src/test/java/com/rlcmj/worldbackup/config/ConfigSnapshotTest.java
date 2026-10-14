@@ -25,6 +25,7 @@ public class ConfigSnapshotTest {
     public void restoreDefaults() {
         WorldBackupConfig.enabled = true;
         WorldBackupConfig.scheduledEnabled = true;
+        WorldBackupConfig.worldLoadEnabled = true;
         WorldBackupConfig.exitEnabled = true;
         WorldBackupConfig.mode = BackupMode.INCREMENTAL;
         WorldBackupConfig.intervalMinutes = 20;
@@ -41,6 +42,7 @@ public class ConfigSnapshotTest {
 
         assertTrue(snapshot.isEnabled());
         assertTrue(snapshot.isScheduledEnabled());
+        assertTrue(snapshot.isWorldLoadEnabled());
         assertTrue(snapshot.isExitEnabled());
         assertEquals(BackupMode.INCREMENTAL, snapshot.getMode());
         assertEquals(20, snapshot.getIntervalMinutes());
@@ -48,6 +50,16 @@ public class ConfigSnapshotTest {
         assertEquals(5, snapshot.getIncrementsPerBase());
         assertEquals(gameDir.resolve("backups").toAbsolutePath().normalize(),
             snapshot.getBackupRoot());
+    }
+
+    @Test
+    public void capturesDisabledWorldLoadSetting() throws Exception {
+        Path gameDir = temporaryFolder.newFolder("game-world-load-disabled").toPath();
+        WorldBackupConfig.worldLoadEnabled = false;
+
+        ConfigSnapshot snapshot = ConfigSnapshot.capture(gameDir);
+
+        assertFalse(snapshot.isWorldLoadEnabled());
     }
 
     @Test

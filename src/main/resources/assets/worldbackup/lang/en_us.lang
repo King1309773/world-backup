@@ -3,6 +3,8 @@ worldbackup.config.enabled=Enable backups
 worldbackup.config.enabled.tooltip=Master switch for all automatic and manual backups.
 worldbackup.config.scheduled_enabled=Enable scheduled backups
 worldbackup.config.scheduled_enabled.tooltip=Create backups periodically while a single-player world is open.
+worldbackup.config.world_load_enabled=Back up when entering a world
+worldbackup.config.world_load_enabled.tooltip=Create a backup after a single-player world loads.
 worldbackup.config.exit_enabled=Back up when leaving a world
 worldbackup.config.exit_enabled.tooltip=Create a backup before a single-player world closes.
 worldbackup.config.mode=Backup mode
@@ -68,6 +70,7 @@ worldbackup.mode.full=Full
 worldbackup.mode.incremental=Smart Incremental
 worldbackup.mode.overwrite=Overwrite
 worldbackup.trigger.scheduled=Scheduled
+worldbackup.trigger.world_load=World Load
 worldbackup.trigger.exit=World Exit
 worldbackup.trigger.manual=Manual
 

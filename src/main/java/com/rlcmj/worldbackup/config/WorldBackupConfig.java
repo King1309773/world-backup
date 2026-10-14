@@ -12,6 +12,9 @@ public final class WorldBackupConfig {
     @Config.LangKey("worldbackup.config.scheduled_enabled")
     public static boolean scheduledEnabled = true;
 
+    @Config.LangKey("worldbackup.config.world_load_enabled")
+    public static boolean worldLoadEnabled = true;
+
     @Config.LangKey("worldbackup.config.exit_enabled")
     public static boolean exitEnabled = true;
 

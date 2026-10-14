@@ -3,6 +3,8 @@ worldbackup.config.enabled=启用备份
 worldbackup.config.enabled.tooltip=控制全部自动备份和手动备份的总开关。
 worldbackup.config.scheduled_enabled=启用定时备份
 worldbackup.config.scheduled_enabled.tooltip=打开单人存档时，按设定间隔创建备份。
+worldbackup.config.world_load_enabled=进入存档时备份
+worldbackup.config.world_load_enabled.tooltip=进入单人存档后创建备份。
 worldbackup.config.exit_enabled=退出存档时备份
 worldbackup.config.exit_enabled.tooltip=关闭单人存档前创建备份。
 worldbackup.config.mode=备份模式
@@ -68,6 +70,7 @@ worldbackup.mode.full=全量备份
 worldbackup.mode.incremental=智能增量
 worldbackup.mode.overwrite=覆写备份
 worldbackup.trigger.scheduled=定时备份
+worldbackup.trigger.world_load=进入世界
 worldbackup.trigger.exit=退出存档
 worldbackup.trigger.manual=手动备份
 

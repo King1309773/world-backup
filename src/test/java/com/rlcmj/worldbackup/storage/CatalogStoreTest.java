@@ -300,6 +300,20 @@ public class CatalogStoreTest {
     }
 
     @Test
+    public void roundTripsWorldLoadTrigger() throws Exception {
+        Path repo = temp.newFolder("world-load-trigger").toPath();
+        BackupCatalog catalog = BackupCatalog.empty("World1", "My World");
+        catalog.add(BackupVersion.full("v1", 1000L, BackupTrigger.WORLD_LOAD,
+            "v1-full.zip", 50L, 30L, 1234L, new SnapshotManifest()));
+
+        new CatalogStore().save(repo, catalog);
+        BackupCatalog loaded = new CatalogStore().load(repo);
+
+        assertEquals(BackupTrigger.WORLD_LOAD,
+            loaded.getVersions().get(0).getTrigger());
+    }
+
+    @Test
     public void catalogWriteFailureIsCheckedAndPreservesExistingIndex() throws Exception {
         Path repo = temp.newFolder("catalog-write-failure").toPath();
         Path index = repo.resolve("index.json");

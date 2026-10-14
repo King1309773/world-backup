@@ -17,6 +17,7 @@ import java.util.Objects;
 public final class ConfigSnapshot {
     private final boolean enabled;
     private final boolean scheduledEnabled;
+    private final boolean worldLoadEnabled;
     private final boolean exitEnabled;
     private final BackupMode mode;
     private final int intervalMinutes;
@@ -25,10 +26,12 @@ public final class ConfigSnapshot {
     private final Path backupRoot;
 
     private ConfigSnapshot(boolean enabled, boolean scheduledEnabled,
-            boolean exitEnabled, BackupMode mode, int intervalMinutes,
-            int maxVersions, int incrementsPerBase, Path backupRoot) {
+            boolean worldLoadEnabled, boolean exitEnabled, BackupMode mode,
+            int intervalMinutes, int maxVersions, int incrementsPerBase,
+            Path backupRoot) {
         this.enabled = enabled;
         this.scheduledEnabled = scheduledEnabled;
+        this.worldLoadEnabled = worldLoadEnabled;
         this.exitEnabled = exitEnabled;
         this.mode = Objects.requireNonNull(mode, "mode");
         this.intervalMinutes = intervalMinutes;
@@ -79,6 +82,7 @@ public final class ConfigSnapshot {
         ConfigSnapshot snapshot = new ConfigSnapshot(
             WorldBackupConfig.enabled,
             WorldBackupConfig.scheduledEnabled,
+            WorldBackupConfig.worldLoadEnabled,
             WorldBackupConfig.exitEnabled,
             WorldBackupConfig.mode,
             Math.max(1, WorldBackupConfig.intervalMinutes),
@@ -143,6 +147,10 @@ public final class ConfigSnapshot {
 
     public boolean isScheduledEnabled() {
         return scheduledEnabled;
+    }
+
+    public boolean isWorldLoadEnabled() {
+        return worldLoadEnabled;
     }
 
     public boolean isExitEnabled() {
