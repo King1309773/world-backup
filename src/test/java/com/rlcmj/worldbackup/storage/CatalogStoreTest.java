@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -43,6 +44,16 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public class CatalogStoreTest {
+    @Test
+    public void appendsWorldLoadTriggerWithoutChangingExistingOrdinals() {
+        assertArrayEquals(new BackupTrigger[] {
+            BackupTrigger.SCHEDULED,
+            BackupTrigger.EXIT,
+            BackupTrigger.MANUAL,
+            BackupTrigger.WORLD_LOAD
+        }, BackupTrigger.values());
+    }
+
     @Test
     public void oversizedSavePreservesPreviousCatalogAndCleansTemporaryFile()
             throws Exception {
