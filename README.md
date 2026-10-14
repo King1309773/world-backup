@@ -94,7 +94,7 @@ Forge 的 Mod Options 中可修改以下 9 项设置；默认配置适合直接�
 ### Automated verified
 
 - 2026-10-14：使用项目内 Temurin OpenJDK `1.8.0_504` 执行 `clean test build --offline --no-daemon --max-workers=1` 成功。
-- JUnit：16 个测试套件，296 个测试，0 failure，0 error，1 个平台条件测试 skipped。
+- JUnit：16 个测试套件，299 个测试，0 failure，0 error，1 个平台条件测试 skipped。
 - `worldbackup-1.0.0.jar` 已核对包含 `mcmod.info`、`WorldBackup.class`、`zh_cn.lang`、`en_us.lang`、`META-INF/worldbackup_at.cfg`、`ClientEventHandler$WorldLoadTimer.class`、`ClientEventHandler$WorldLoadTickPolicy.class`、GUI 与 runtime 类；没有测试 class，也未扫描到邮箱或绝对本机路径。
 - 自动化测试覆盖配置快照、内部 staging 保留区与仓库防误删、进入世界后延迟触发、忙时静默重试、进入世界与定时截止时间独立、定时/退出/手动协调、全量/增量/覆写创建、增量链和基线轮换、visible/hidden 保留依赖、归档校验、截断/损坏不可用、恢复交换与安全副本、回滚恢复路径诊断、删除和路径安全等核心行为。它们不是实际 UI 操作的替代品。
 
