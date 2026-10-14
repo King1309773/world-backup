@@ -20,12 +20,13 @@ $env:Path = "$env:JAVA_HOME\bin;$env:JAVA_HOME\jre\bin;$env:Path"
 
 ## 配置
 
-Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接使用：
+Forge 的 Mod Options 中可修改以下 9 项设置；默认配置适合直接使用：
 
 | 设置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 总开关；关闭后手动和自动备份都不会运行 |
 | `scheduledEnabled` | `true` | 启用定时备份 |
+| `worldLoadEnabled` | `true` | 进入单人世界且客户端世界就绪后等待 10 秒，再为本次进入请求一次备份；若协调器正忙，会静默等待直到请求被接受 |
 | `exitEnabled` | `true` | 退出单人世界时备份 |
 | `mode` | `INCREMENTAL` | 备份模式：`FULL`、`INCREMENTAL` 或 `OVERWRITE` |
 | `intervalMinutes` | `20` | 定时备份间隔，最小 1 分钟 |
@@ -33,11 +34,15 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 | `incrementsPerBase` | `5` | 每个基线最多连续创建的增量数，最小为 1 |
 | `backupPath` | `backups` | 相对游戏目录或绝对路径；修改后不会搬迁已有备份 |
 
+进入世界备份与定时备份相互独立。进入世界备份被接受时，不会重置或推迟默认 20 分钟的定时备份截止时间。
+
 `<游戏目录>/.worldbackup-staging` 是模组保留的内部临时目录。`backupPath`
 不得等于该目录、位于该目录中，也不得是包含该目录的祖先目录；路径校验会尽力解析已存在的
 符号链接或 Windows junction 后再判断。默认的 `<游戏目录>/backups` 不受影响。
 
 “创建手动备份”按键默认未绑定。进入“选项 → 控制”，在“世界备份”分类中为它绑定按键。按键只在已加载的单人世界中生效，并受 `enabled` 总开关控制。
+
+每次备份结束后，成功消息为 `备份成功，用时 %s 秒`；失败消息同样包含耗时，并附带失败原因。
 
 ## 备份格式与保留策略
 
@@ -51,7 +56,7 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 └── <版本 ID>-latest.zip
 ```
 
-每个 ZIP 内有 `manifest.json`，文件内容位于 `data/<世界内相对路径>`。全量基线使用 `-full.zip`，增量使用 `-delta.zip`，覆写模式使用 `-latest.zip`。索引记录触发来源、父版本、基线、快照清单、变更和删除路径。
+每个 ZIP 内有 `manifest.json`，文件内容位于 `data/<世界内相对路径>`。全量基线使用 `-full.zip`，增量使用 `-delta.zip`，覆写模式使用 `-latest.zip`。索引记录触发来源、父版本、基线、快照清单、变更和删除路径；进入世界触发在索引中记为 `WORLD_LOAD`，并在备份管理器中显示为“进入世界”。
 
 智能增量会比较文件大小、修改时间和 SHA-256；内容未变的文件不会重复写入增量包。为避免每次备份都重新读取并散列整个世界，扫描器在文件大小和修改时间都与上一份清单相同时会复用历史 SHA-256。若外部工具改写了文件内容、同时刻意保留相同大小和相同修改时间，该变化可能无法被识别；对这类工具处理过的世界，应先创建新的全量基线或确保修改时间发生变化。达到 `incrementsPerBase` 后自动创建新的全量基线。Minecraft region 文件（`.mca`）按普通文件处理：只要内容变化，就把整个 `.mca` 写入归档，不进行区块级差分。
 
@@ -89,14 +94,14 @@ Forge 的 Mod Options 中可修改以下 8 项设置；默认配置适合直接�
 ### Automated verified
 
 - 2026-10-14：使用项目内 Temurin OpenJDK `1.8.0_504` 执行 `clean test build --offline --no-daemon --max-workers=1` 成功。
-- JUnit：16 个测试套件，282 个测试，0 failure，0 error，1 个平台条件测试 skipped。
-- `worldbackup-1.0.0.jar` 已核对包含 `mcmod.info`、`WorldBackup.class`、`zh_cn.lang`、`en_us.lang`、`META-INF/worldbackup_at.cfg`、GUI 与 runtime 类；没有测试 class，也未扫描到邮箱或绝对本机路径。
-- 自动化测试覆盖配置快照、内部 staging 保留区与仓库防误删、定时/退出/手动协调、全量/增量/覆写创建、增量链和基线轮换、visible/hidden 保留依赖、归档校验、截断/损坏不可用、恢复交换与安全副本、回滚恢复路径诊断、删除和路径安全等核心行为。它们不是实际 UI 操作的替代品。
+- JUnit：16 个测试套件，296 个测试，0 failure，0 error，1 个平台条件测试 skipped。
+- `worldbackup-1.0.0.jar` 已核对包含 `mcmod.info`、`WorldBackup.class`、`zh_cn.lang`、`en_us.lang`、`META-INF/worldbackup_at.cfg`、`ClientEventHandler$WorldLoadTimer.class`、`ClientEventHandler$WorldLoadTickPolicy.class`、GUI 与 runtime 类；没有测试 class，也未扫描到邮箱或绝对本机路径。
+- 自动化测试覆盖配置快照、内部 staging 保留区与仓库防误删、进入世界后延迟触发、忙时静默重试、进入世界与定时截止时间独立、定时/退出/手动协调、全量/增量/覆写创建、增量链和基线轮换、visible/hidden 保留依赖、归档校验、截断/损坏不可用、恢复交换与安全副本、回滚恢复路径诊断、删除和路径安全等核心行为。它们不是实际 UI 操作的替代品。
 
 ### Manual pending
 
 2026-10-13 的 `runClient` 验证确认项目 JDK 中存在 `jre/bin/awt.dll`。通过仅对本次进程补充 PATH 和 `java.library.path` 后，客户端已越过原先的 AWT native 错误，创建 OpenGL 上下文并识别、启用 `worldbackup 1.0.0`；随后 ForgeGradle/LegacyDev 开发环境在 Forge 自身 `NetworkRegistry.newChannel` 处抛出 `NullPointerException`，未到达主菜单。该失败发生在 FML 构造阶段，不是 World Backup 的初始化或测试失败，但它阻止了 UI 验证。没有创建测试世界，也没有打开或修改任何已有世界。真实 RLCMJ BETA3 实例的主菜单启动未通过可安全复现的独立命令行完成，留待用户手测。
 
-因此以下项目仍为 manual pending，不能标记为通过：手动按键默认未绑定与绑定后备份、成功消息和耗时、1 分钟定时备份、退出开关组合、增量 manifest、新基线节奏、保留 10 个恢复点、恢复安全副本、截断归档不可恢复、全量/覆写模式、世界选择界面的管理入口，以及真实整合包主菜单启动。
+因此以下项目仍为 manual pending，不能标记为通过：进入世界且客户端世界就绪后 10 秒备份、进入世界触发在管理器中显示、手动按键默认未绑定与绑定后备份、成功/失败消息和耗时、1 分钟定时备份、退出开关组合、增量 manifest、新基线节奏、保留 10 个恢复点、恢复安全副本、截断归档不可恢复、全量/覆写模式、世界选择界面的管理入口，以及真实整合包主菜单启动。
 
 验证过程不得打开任何已有世界。若需要客户端验证，只能创建名称明确的临时测试世界（例如 `WB_TEST_<时间戳>`），并在结束后记录它是否已删除；验证结束时配置必须恢复为默认的 20 分钟间隔和 `INCREMENTAL` 模式。
