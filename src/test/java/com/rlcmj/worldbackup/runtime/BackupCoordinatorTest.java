@@ -135,7 +135,9 @@ public class BackupCoordinatorTest {
         FakeRuntime runtime = new FakeRuntime();
         runtime.blockUntilCancelled = true;
         ManualWatchdog watchdog = new ManualWatchdog();
-        BackupCoordinator coordinator = coordinator(runtime, watchdog);
+        AtomicLong nanos = new AtomicLong();
+        BackupCoordinator coordinator = coordinator(runtime, watchdog,
+            () -> nanos.getAndAdd(TimeUnit.SECONDS.toNanos(5L)));
 
         coordinator.request(new Object(), BackupTrigger.MANUAL);
         assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
@@ -145,6 +147,25 @@ public class BackupCoordinatorTest {
         assertTrue(runtime.workerCleaned);
         assertEquals(1, runtime.unfreezeCount);
         assertEquals("worldbackup.error.timeout", runtime.messages.get(1));
+        assertEquals(1, runtime.messageArguments.get(1).length);
+        assertEquals("5.0", runtime.messageArguments.get(1)[0]);
+    }
+
+    @Test
+    public void silentWorldLoadRaceRejectsWithoutBusyMessage() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.blockBackup = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+
+        assertTrue(coordinator.request(new Object(), BackupTrigger.MANUAL));
+        assertTrue(runtime.backupEntered.await(2, TimeUnit.SECONDS));
+        int messagesBeforeRace = runtime.messages.size();
+
+        assertFalse(coordinator.requestSilently(new Object(), BackupTrigger.WORLD_LOAD));
+        assertEquals(messagesBeforeRace, runtime.messages.size());
+
+        runtime.backupRelease.countDown();
+        await(() -> !coordinator.isActive());
     }
 
     @Test
@@ -481,8 +502,8 @@ public class BackupCoordinatorTest {
         Object server = new Object();
         ClientEventHandler.WorldLoadTickPolicy policy =
             new ClientEventHandler.WorldLoadTickPolicy();
-        ClientEventHandler.BusyRequester requester =
-            new ClientEventHandler.BusyRequester() {
+        ClientEventHandler.TickRequester requester =
+            new ClientEventHandler.TickRequester() {
                 @Override public boolean isBusy() {
                     return coordinator.isBusy();
                 }
@@ -490,6 +511,11 @@ public class BackupCoordinatorTest {
                 @Override public boolean request(Object requestedServer,
                                                  BackupTrigger trigger) {
                     return coordinator.request(requestedServer, trigger);
+                }
+
+                @Override public boolean tryRequestSilently(Object requestedServer,
+                                                            BackupTrigger trigger) {
+                    return coordinator.requestSilently(requestedServer, trigger);
                 }
             };
         policy.tick(server, true, 0L, requester);

@@ -72,6 +72,14 @@ public final class BackupCoordinator {
     }
 
     boolean request(Object server, BackupTrigger trigger) {
+        return request(server, trigger, true);
+    }
+
+    boolean requestSilently(Object server, BackupTrigger trigger) {
+        return request(server, trigger, false);
+    }
+
+    private boolean request(Object server, BackupTrigger trigger, boolean notifyBusy) {
         Objects.requireNonNull(server, "server");
         Objects.requireNonNull(trigger, "trigger");
         if (!runtime.normalBackupsEnabled(server)) {
@@ -82,7 +90,7 @@ public final class BackupCoordinator {
         synchronized (arbitration) {
             if (restoreActive.get() || maintenance.get() != null || shutdownArbitrating.get()
                     || !active.compareAndSet(null, candidate)) {
-                runtime.message("worldbackup.message.busy");
+                if (notifyBusy) runtime.message("worldbackup.message.busy");
                 return false;
             }
         }

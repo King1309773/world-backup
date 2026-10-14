@@ -27,20 +27,25 @@ public final class ClientEventHandler {
     private final BackupCoordinator coordinator;
     private final KeyBinding manualBackup = new KeyBinding("key.worldbackup.manual",
         Keyboard.KEY_NONE, "key.categories.worldbackup");
-    private final BackupTimer timer = new BackupTimer();
-    private final WorldLoadTickPolicy worldLoadPolicy = new WorldLoadTickPolicy();
-    private final BusyRequester worldLoadRequester;
+    private final AutomaticBackupTickPolicy automaticBackupPolicy =
+        new AutomaticBackupTickPolicy();
+    private final TickRequester automaticBackupRequester;
     private final Map<GuiWorldSelection, GuiButton> managerButtons = new WeakHashMap<>();
 
     public ClientEventHandler(BackupCoordinator coordinator) {
         this.coordinator = coordinator;
-        this.worldLoadRequester = new BusyRequester() {
+        this.automaticBackupRequester = new TickRequester() {
             @Override public boolean isBusy() {
                 return coordinator.isBusy();
             }
 
             @Override public boolean request(Object server, BackupTrigger trigger) {
                 return coordinator.request(server, trigger);
+            }
+
+            @Override public boolean tryRequestSilently(Object server,
+                                                        BackupTrigger trigger) {
+                return coordinator.requestSilently(server, trigger);
             }
         };
         ClientRegistry.registerKeyBinding(manualBackup);
@@ -59,15 +64,12 @@ public final class ClientEventHandler {
         }
         boolean worldLoad = loaded && WorldBackupConfig.enabled
             && WorldBackupConfig.worldLoadEnabled;
-        long now = System.nanoTime();
-        worldLoadPolicy.tick(server, worldLoad, now, worldLoadRequester);
         boolean scheduled = loaded && WorldBackupConfig.enabled
             && WorldBackupConfig.scheduledEnabled;
         long interval = TimeUnit.MINUTES.toNanos(
             Math.max(1, WorldBackupConfig.intervalMinutes));
-        if (timer.due(scheduled ? server : null, scheduled, interval, now)) {
-            coordinator.request(server, BackupTrigger.SCHEDULED);
-        }
+        automaticBackupPolicy.tick(server, worldLoad, scheduled, interval,
+            System.nanoTime(), automaticBackupRequester);
     }
 
     @SubscribeEvent
@@ -168,12 +170,12 @@ public final class ClientEventHandler {
             if (server != serverIdentity || !armed || intervalNanos != armedIntervalNanos) {
                 serverIdentity = server;
                 armedIntervalNanos = intervalNanos;
-                nextScheduledNanos = ClientEventHandler.saturatingAdd(now, intervalNanos);
+                nextScheduledNanos = now + intervalNanos;
                 armed = true;
                 return false;
             }
             if (now - nextScheduledNanos < 0L) return false;
-            nextScheduledNanos = ClientEventHandler.saturatingAdd(now, intervalNanos);
+            nextScheduledNanos = now + intervalNanos;
             return true;
         }
     }
@@ -193,7 +195,7 @@ public final class ClientEventHandler {
             }
             if (server != serverIdentity || !armed) {
                 serverIdentity = server;
-                deadlineNanos = saturatingAdd(now, WORLD_LOAD_DELAY_NANOS);
+                deadlineNanos = now + WORLD_LOAD_DELAY_NANOS;
                 armed = true;
                 accepted = false;
                 return false;
@@ -208,6 +210,10 @@ public final class ClientEventHandler {
 
     interface BusyRequester {
         boolean isBusy();
+        boolean tryRequestSilently(Object server, BackupTrigger trigger);
+    }
+
+    interface TickRequester extends BusyRequester {
         boolean request(Object server, BackupTrigger trigger);
     }
 
@@ -218,15 +224,26 @@ public final class ClientEventHandler {
                      BusyRequester requester) {
             if (!timer.due(enabled ? server : null, enabled, now)
                     || requester.isBusy()) return false;
-            if (!requester.request(server, BackupTrigger.WORLD_LOAD)) return false;
+            if (!requester.tryRequestSilently(server, BackupTrigger.WORLD_LOAD)) {
+                return false;
+            }
             timer.accepted(server);
             return true;
         }
     }
 
-    private static long saturatingAdd(long value, long increment) {
-        if (increment > 0L && value > Long.MAX_VALUE - increment) return Long.MAX_VALUE;
-        return value + increment;
+    static final class AutomaticBackupTickPolicy {
+        private final BackupTimer scheduledTimer = new BackupTimer();
+        private final WorldLoadTickPolicy worldLoadPolicy = new WorldLoadTickPolicy();
+
+        void tick(Object server, boolean worldLoadEnabled, boolean scheduledEnabled,
+                  long intervalNanos, long now, TickRequester requester) {
+            if (scheduledTimer.due(scheduledEnabled ? server : null, scheduledEnabled,
+                    intervalNanos, now)) {
+                requester.request(server, BackupTrigger.SCHEDULED);
+            }
+            worldLoadPolicy.tick(server, worldLoadEnabled, now, requester);
+        }
     }
 
     static final class RestoreUiGuard {

@@ -2,6 +2,9 @@ package com.rlcmj.worldbackup.runtime;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.rlcmj.worldbackup.core.BackupTrigger;
@@ -54,6 +57,33 @@ public class ClientEventHandlerTest {
         assertTrue(policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 1L, requester));
         assertEquals(2, requester.requests);
         policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 2L, requester);
+        assertEquals(2, requester.requests);
+    }
+
+    @Test
+    public void scheduledWinsWhenBothTimersAreDueAndWorldLoadRetriesNextTick() {
+        ClientEventHandler.AutomaticBackupTickPolicy policy =
+            new ClientEventHandler.AutomaticBackupTickPolicy();
+        RecordingRequester requester = new RecordingRequester();
+        requester.becomeBusyAfterRequest = true;
+        Object server = new Object();
+
+        policy.tick(server, true, true, WORLD_LOAD_DELAY_NANOS, 0L, requester);
+        policy.tick(server, true, true, WORLD_LOAD_DELAY_NANOS,
+            WORLD_LOAD_DELAY_NANOS, requester);
+
+        assertEquals(Arrays.asList(BackupTrigger.SCHEDULED), requester.triggers);
+        assertEquals(0, requester.silentRequests);
+
+        requester.busy = false;
+        policy.tick(server, true, true, WORLD_LOAD_DELAY_NANOS,
+            WORLD_LOAD_DELAY_NANOS + 1L, requester);
+
+        assertEquals(Arrays.asList(BackupTrigger.SCHEDULED, BackupTrigger.WORLD_LOAD),
+            requester.triggers);
+        assertEquals(1, requester.silentRequests);
+        policy.tick(server, true, true, WORLD_LOAD_DELAY_NANOS,
+            WORLD_LOAD_DELAY_NANOS + 2L, requester);
         assertEquals(2, requester.requests);
     }
 
@@ -143,40 +173,50 @@ public class ClientEventHandlerTest {
     }
 
     @Test
-    public void worldLoadDeadlineSaturatesOnOverflow() {
+    public void worldLoadDeadlineUsesNanoTimeWraparound() {
         ClientEventHandler.WorldLoadTimer timer = new ClientEventHandler.WorldLoadTimer();
         Object server = new Object();
+        long start = Long.MAX_VALUE - 1L;
+        long beforeDeadline = start + WORLD_LOAD_DELAY_NANOS - 1L;
+        long deadline = start + WORLD_LOAD_DELAY_NANOS;
 
-        assertFalse(timer.due(server, true, Long.MAX_VALUE - 1L));
-        assertFalse(timer.due(server, true, Long.MAX_VALUE - 1L));
-        assertTrue(timer.due(server, true, Long.MAX_VALUE));
+        assertFalse(timer.due(server, true, start));
+        assertFalse(timer.due(server, true, beforeDeadline));
+        assertTrue(timer.due(server, true, deadline));
     }
 
     @Test
     public void acceptingWorldLoadDoesNotMoveScheduledDeadline() {
-        ClientEventHandler.WorldLoadTickPolicy worldLoad =
-            new ClientEventHandler.WorldLoadTickPolicy();
-        ClientEventHandler.BackupTimer scheduled = new ClientEventHandler.BackupTimer();
+        ClientEventHandler.AutomaticBackupTickPolicy policy =
+            new ClientEventHandler.AutomaticBackupTickPolicy();
         RecordingRequester requester = new RecordingRequester();
         Object server = new Object();
         long scheduledInterval = TimeUnit.SECONDS.toNanos(30L);
 
-        assertFalse(worldLoad.tick(server, true, 0L, requester));
-        assertFalse(scheduled.due(server, true, scheduledInterval, 0L));
-        assertTrue(worldLoad.tick(server, true, WORLD_LOAD_DELAY_NANOS, requester));
-        assertFalse(scheduled.due(server, true, scheduledInterval,
-            WORLD_LOAD_DELAY_NANOS));
-        assertTrue(scheduled.due(server, true, scheduledInterval,
-            scheduledInterval));
+        policy.tick(server, true, true, scheduledInterval, 0L, requester);
+        policy.tick(server, true, true, scheduledInterval,
+            WORLD_LOAD_DELAY_NANOS, requester);
+        assertEquals(Arrays.asList(BackupTrigger.WORLD_LOAD), requester.triggers);
+
+        policy.tick(server, true, true, scheduledInterval,
+            scheduledInterval - 1L, requester);
+        assertEquals(Arrays.asList(BackupTrigger.WORLD_LOAD), requester.triggers);
+        policy.tick(server, true, true, scheduledInterval,
+            scheduledInterval, requester);
+        assertEquals(Arrays.asList(BackupTrigger.WORLD_LOAD, BackupTrigger.SCHEDULED),
+            requester.triggers);
     }
 
     private static final class RecordingRequester
-            implements ClientEventHandler.BusyRequester {
+            implements ClientEventHandler.TickRequester {
         private boolean busy;
         private boolean accept = true;
+        private boolean becomeBusyAfterRequest;
         private int requests;
+        private int silentRequests;
         private Object server;
         private BackupTrigger trigger;
+        private final List<BackupTrigger> triggers = new ArrayList<>();
 
         @Override public boolean isBusy() { return busy; }
 
@@ -184,7 +224,15 @@ public class ClientEventHandlerTest {
             requests++;
             this.server = server;
             this.trigger = trigger;
+            triggers.add(trigger);
+            if (becomeBusyAfterRequest) busy = true;
             return accept;
+        }
+
+        @Override public boolean tryRequestSilently(Object server,
+                                                    BackupTrigger trigger) {
+            silentRequests++;
+            return request(server, trigger);
         }
     }
 
@@ -228,6 +276,18 @@ public class ClientEventHandlerTest {
         assertFalse(timer.due(server, true, 500L, 100L));
         assertFalse(timer.due(server, true, 500L, 589L));
         assertTrue(timer.due(server, true, 500L, 590L));
+    }
+
+    @Test
+    public void scheduledDeadlineUsesNanoTimeWraparound() {
+        ClientEventHandler.BackupTimer timer = new ClientEventHandler.BackupTimer();
+        Object server = new Object();
+        long interval = TimeUnit.SECONDS.toNanos(10L);
+        long start = Long.MAX_VALUE - 1L;
+
+        assertFalse(timer.due(server, true, interval, start));
+        assertFalse(timer.due(server, true, interval, start + interval - 1L));
+        assertTrue(timer.due(server, true, interval, start + interval));
     }
 
     @Test
