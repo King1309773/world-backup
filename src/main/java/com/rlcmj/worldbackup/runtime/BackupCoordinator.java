@@ -140,7 +140,10 @@ public final class BackupCoordinator {
     }
 
     public boolean isBusy() {
-        return active.get() != null || restoreActive.get() || maintenance.get() != null;
+        synchronized (arbitration) {
+            return active.get() != null || restoreActive.get()
+                || maintenance.get() != null || shutdownArbitrating.get();
+        }
     }
 
     public boolean isRestoreActive() {
@@ -233,101 +236,103 @@ public final class BackupCoordinator {
 
     void onServerStopping(Object server) {
         ActiveMaintenance stoppingMaintenance;
+        boolean stoppingRestore;
         synchronized (arbitration) {
             shutdownArbitrating.set(true);
-            if (restoreActive.get()) {
-                shutdownArbitrating.set(false);
-                runtime.message("worldbackup.message.exit_skipped_busy");
-                return;
-            }
+            stoppingRestore = restoreActive.get();
             stoppingMaintenance = maintenance.get();
         }
-        if (stoppingMaintenance != null) {
-            try {
-                stoppingMaintenance.workerDone.get(shutdownWaitNanos,
-                    TimeUnit.NANOSECONDS);
-                stoppingMaintenance.terminal.compareAndSet(false, true);
-                maintenance.compareAndSet(stoppingMaintenance, null);
-            } catch (InterruptedException failure) {
-                Thread.currentThread().interrupt();
-                shutdownArbitrating.set(false);
-                runtime.message("worldbackup.message.exit_skipped_busy");
-                return;
-            } catch (ExecutionException | TimeoutException failure) {
-                shutdownArbitrating.set(false);
+        try {
+            if (stoppingRestore) {
                 runtime.message("worldbackup.message.exit_skipped_busy");
                 return;
             }
-        }
-        ActiveBackup current = active.get();
-        Object snapshot = null;
-        boolean ownsActive = current != null && current.server == server
-            && current.shutdown.compareAndSet(false, true);
-        long startedNanos = ownsActive ? current.startedNanos : clock.nanoTime();
-        BackupResult exitResult = null;
-        Throwable failure = null;
-        boolean cleanupDeferred = false;
-        try {
-            if (ownsActive) {
-                current.cancelWatchdog();
-                current.cancelQueuedPreparation();
-                cancelWorker(current);
-                snapshot = current.snapshot;
+            if (stoppingMaintenance != null) {
                 try {
-                    waitForCleanup(current);
-                    if (!current.worldsReleased) releaseActiveWorlds(current);
-                    if (snapshot != null && current.worldsReleased) {
-                        runtime.cleanupSnapshot(snapshot);
-                        current.snapshot = null;
-                        snapshot = null;
-                    }
-                } catch (TimeoutException | InterruptedException waitFailure) {
-                    if (waitFailure instanceof InterruptedException) {
-                        Thread.currentThread().interrupt();
-                    }
-                    failure = waitFailure;
-                    cleanupDeferred = true;
-                    deferCleanupAndRelease(current, snapshot);
-                    if (!current.worldsReleased) {
-                        try {
-                            releaseActiveWorlds(current);
-                        } catch (Throwable releaseFailure) {
-                            failure.addSuppressed(releaseFailure);
+                    stoppingMaintenance.workerDone.get(shutdownWaitNanos,
+                        TimeUnit.NANOSECONDS);
+                    stoppingMaintenance.terminal.compareAndSet(false, true);
+                    maintenance.compareAndSet(stoppingMaintenance, null);
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    runtime.message("worldbackup.message.exit_skipped_busy");
+                    return;
+                } catch (ExecutionException | TimeoutException failure) {
+                    runtime.message("worldbackup.message.exit_skipped_busy");
+                    return;
+                }
+            }
+            ActiveBackup current = active.get();
+            Object snapshot = null;
+            boolean ownsActive = current != null && current.server == server
+                && current.shutdown.compareAndSet(false, true);
+            long startedNanos = ownsActive ? current.startedNanos : clock.nanoTime();
+            BackupResult exitResult = null;
+            Throwable failure = null;
+            boolean cleanupDeferred = false;
+            try {
+                if (ownsActive) {
+                    current.cancelWatchdog();
+                    current.cancelQueuedPreparation();
+                    cancelWorker(current);
+                    snapshot = current.snapshot;
+                    try {
+                        waitForCleanup(current);
+                        if (!current.worldsReleased) releaseActiveWorlds(current);
+                        if (snapshot != null && current.worldsReleased) {
+                            runtime.cleanupSnapshot(snapshot);
+                            current.snapshot = null;
+                            snapshot = null;
+                        }
+                    } catch (TimeoutException | InterruptedException waitFailure) {
+                        if (waitFailure instanceof InterruptedException) {
+                            Thread.currentThread().interrupt();
+                        }
+                        failure = waitFailure;
+                        cleanupDeferred = true;
+                        deferCleanupAndRelease(current, snapshot);
+                        if (!current.worldsReleased) {
+                            try {
+                                releaseActiveWorlds(current);
+                            } catch (Throwable releaseFailure) {
+                                failure.addSuppressed(releaseFailure);
+                            }
                         }
                     }
                 }
-            }
-            if (!cleanupDeferred && runtime.exitBackupEnabled(server)) {
-                if (snapshot == null) snapshot = runtime.freeze(server);
-                BackupJob job = runtime.createJob(server, snapshot, BackupTrigger.EXIT);
-                exitResult = runtime.run(job, new BackupCancellation());
-            }
-        } catch (Throwable operationFailure) {
-            failure = operationFailure;
-        } finally {
-            if (snapshot != null && !cleanupDeferred) {
-                try {
-                    runtime.unfreeze(snapshot);
-                } catch (Throwable cleanupFailure) {
-                    if (failure == null) failure = cleanupFailure;
-                    else failure.addSuppressed(cleanupFailure);
+                if (!cleanupDeferred && runtime.exitBackupEnabled(server)) {
+                    if (snapshot == null) snapshot = runtime.freeze(server);
+                    BackupJob job = runtime.createJob(server, snapshot, BackupTrigger.EXIT);
+                    exitResult = runtime.run(job, new BackupCancellation());
+                }
+            } catch (Throwable operationFailure) {
+                failure = operationFailure;
+            } finally {
+                if (snapshot != null && !cleanupDeferred) {
+                    try {
+                        runtime.unfreeze(snapshot);
+                    } catch (Throwable cleanupFailure) {
+                        if (failure == null) failure = cleanupFailure;
+                        else failure.addSuppressed(cleanupFailure);
+                    }
+                }
+                if (ownsActive && !cleanupDeferred) {
+                    current.finished.set(true);
+                    active.compareAndSet(current, null);
                 }
             }
-            if (ownsActive && !cleanupDeferred) {
-                current.finished.set(true);
-                active.compareAndSet(current, null);
+            if (failure != null) {
+                runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
+                    errorComponent(failure));
+            } else if (exitResult != null && exitResult.isSuccess()) {
+                runtime.message("worldbackup.message.success", secondsSince(startedNanos));
+            } else if (exitResult != null) {
+                runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
+                    new TextComponentTranslation(exitResult.getErrorKey()));
             }
+        } finally {
+            shutdownArbitrating.set(false);
         }
-        if (failure != null) {
-            runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
-                errorComponent(failure));
-        } else if (exitResult != null && exitResult.isSuccess()) {
-            runtime.message("worldbackup.message.success", secondsSince(startedNanos));
-        } else if (exitResult != null) {
-            runtime.message("worldbackup.message.failure", secondsSince(startedNanos),
-                new TextComponentTranslation(exitResult.getErrorKey()));
-        }
-        shutdownArbitrating.set(false);
     }
 
     private void releaseActiveWorlds(ActiveBackup backup) throws Exception {

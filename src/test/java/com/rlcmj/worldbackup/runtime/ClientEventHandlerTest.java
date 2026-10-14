@@ -4,11 +4,81 @@ import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
 
+import com.rlcmj.worldbackup.core.BackupTrigger;
+
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class ClientEventHandlerTest {
     private static final long WORLD_LOAD_DELAY_NANOS = TimeUnit.SECONDS.toNanos(10L);
+
+    @Test
+    public void worldLoadTickPolicyWaitsThroughBusyThenRequestsWorldLoadOnce() {
+        ClientEventHandler.WorldLoadTickPolicy policy =
+            new ClientEventHandler.WorldLoadTickPolicy();
+        RecordingRequester requester = new RecordingRequester();
+        Object server = new Object();
+
+        policy.tick(server, true, 0L, requester);
+        policy.tick(server, true, WORLD_LOAD_DELAY_NANOS - 1L, requester);
+        assertEquals(0, requester.requests);
+
+        requester.busy = true;
+        policy.tick(server, true, WORLD_LOAD_DELAY_NANOS, requester);
+        assertEquals(0, requester.requests);
+
+        requester.busy = false;
+        assertTrue(policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 1L, requester));
+        assertEquals(1, requester.requests);
+        assertEquals(BackupTrigger.WORLD_LOAD, requester.trigger);
+        assertEquals(server, requester.server);
+
+        policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 2L, requester);
+        assertEquals(1, requester.requests);
+    }
+
+    @Test
+    public void worldLoadTickPolicyRetriesRejectedRequestUntilAccepted() {
+        ClientEventHandler.WorldLoadTickPolicy policy =
+            new ClientEventHandler.WorldLoadTickPolicy();
+        RecordingRequester requester = new RecordingRequester();
+        Object server = new Object();
+
+        policy.tick(server, true, 0L, requester);
+        requester.accept = false;
+        assertFalse(policy.tick(server, true, WORLD_LOAD_DELAY_NANOS, requester));
+        assertEquals(1, requester.requests);
+
+        requester.accept = true;
+        assertTrue(policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 1L, requester));
+        assertEquals(2, requester.requests);
+        policy.tick(server, true, WORLD_LOAD_DELAY_NANOS + 2L, requester);
+        assertEquals(2, requester.requests);
+    }
+
+    @Test
+    public void worldLoadTickPolicyRearmsAfterServerSwitchAndDisable() {
+        ClientEventHandler.WorldLoadTickPolicy policy =
+            new ClientEventHandler.WorldLoadTickPolicy();
+        RecordingRequester requester = new RecordingRequester();
+        Object first = new Object();
+        Object second = new Object();
+
+        policy.tick(first, true, 0L, requester);
+        policy.tick(second, true, WORLD_LOAD_DELAY_NANOS, requester);
+        assertEquals(0, requester.requests);
+        assertTrue(policy.tick(second, true, WORLD_LOAD_DELAY_NANOS * 2L, requester));
+        assertEquals(1, requester.requests);
+
+        policy.tick(second, false, WORLD_LOAD_DELAY_NANOS * 2L + 1L, requester);
+        policy.tick(second, true, WORLD_LOAD_DELAY_NANOS * 2L + 2L, requester);
+        policy.tick(second, true, WORLD_LOAD_DELAY_NANOS * 3L + 1L, requester);
+        assertEquals(1, requester.requests);
+        assertTrue(policy.tick(second, true, WORLD_LOAD_DELAY_NANOS * 3L + 2L,
+            requester));
+        assertEquals(2, requester.requests);
+    }
 
     @Test
     public void worldLoadWaitsTenSecondsAndFiresOnceAfterAcceptance() {
@@ -84,20 +154,38 @@ public class ClientEventHandlerTest {
 
     @Test
     public void acceptingWorldLoadDoesNotMoveScheduledDeadline() {
-        ClientEventHandler.WorldLoadTimer worldLoad =
-            new ClientEventHandler.WorldLoadTimer();
+        ClientEventHandler.WorldLoadTickPolicy worldLoad =
+            new ClientEventHandler.WorldLoadTickPolicy();
         ClientEventHandler.BackupTimer scheduled = new ClientEventHandler.BackupTimer();
+        RecordingRequester requester = new RecordingRequester();
         Object server = new Object();
         long scheduledInterval = TimeUnit.SECONDS.toNanos(30L);
 
-        assertFalse(worldLoad.due(server, true, 0L));
+        assertFalse(worldLoad.tick(server, true, 0L, requester));
         assertFalse(scheduled.due(server, true, scheduledInterval, 0L));
-        assertTrue(worldLoad.due(server, true, WORLD_LOAD_DELAY_NANOS));
-        worldLoad.accepted(server);
+        assertTrue(worldLoad.tick(server, true, WORLD_LOAD_DELAY_NANOS, requester));
         assertFalse(scheduled.due(server, true, scheduledInterval,
             WORLD_LOAD_DELAY_NANOS));
         assertTrue(scheduled.due(server, true, scheduledInterval,
             scheduledInterval));
+    }
+
+    private static final class RecordingRequester
+            implements ClientEventHandler.BusyRequester {
+        private boolean busy;
+        private boolean accept = true;
+        private int requests;
+        private Object server;
+        private BackupTrigger trigger;
+
+        @Override public boolean isBusy() { return busy; }
+
+        @Override public boolean request(Object server, BackupTrigger trigger) {
+            requests++;
+            this.server = server;
+            this.trigger = trigger;
+            return accept;
+        }
     }
 
     @Test

@@ -79,6 +79,7 @@ public class BackupCoordinatorTest {
 
         assertEquals("worldbackup.message.success", runtime.messages.get(1));
         assertEquals("3.0", runtime.messageArguments.get(1)[0]);
+        assertEquals(Collections.singletonList(BackupTrigger.WORLD_LOAD), runtime.triggers);
     }
 
     @Test
@@ -95,6 +96,7 @@ public class BackupCoordinatorTest {
         assertEquals(1, runtime.unfreezeCount);
         assertEquals("worldbackup.message.failure", runtime.messages.get(1));
         assertEquals("4.0", runtime.messageArguments.get(1)[0]);
+        assertEquals(Collections.singletonList(BackupTrigger.WORLD_LOAD), runtime.triggers);
     }
 
     @Test
@@ -469,6 +471,47 @@ public class BackupCoordinatorTest {
             runtime.messages.get(runtime.messages.size() - 1));
         assertEquals(1,
             runtime.messageArguments.get(runtime.messageArguments.size() - 1).length);
+    }
+
+    @Test
+    public void shutdownArbitrationIsBusyAndSuppressesWorldLoadRequests() throws Exception {
+        FakeRuntime runtime = new FakeRuntime();
+        runtime.blockExit = true;
+        BackupCoordinator coordinator = coordinator(runtime, new ManualWatchdog());
+        Object server = new Object();
+        ClientEventHandler.WorldLoadTickPolicy policy =
+            new ClientEventHandler.WorldLoadTickPolicy();
+        ClientEventHandler.BusyRequester requester =
+            new ClientEventHandler.BusyRequester() {
+                @Override public boolean isBusy() {
+                    return coordinator.isBusy();
+                }
+
+                @Override public boolean request(Object requestedServer,
+                                                 BackupTrigger trigger) {
+                    return coordinator.request(requestedServer, trigger);
+                }
+            };
+        policy.tick(server, true, 0L, requester);
+
+        Thread stopping = new Thread(() -> coordinator.onServerStopping(server));
+        stopping.start();
+        assertTrue(runtime.exitEntered.await(2, TimeUnit.SECONDS));
+        int messagesBeforeTick = runtime.messages.size();
+
+        assertTrue(coordinator.isBusy());
+        assertFalse(policy.tick(server, true, TimeUnit.SECONDS.toNanos(10L), requester));
+        assertEquals(messagesBeforeTick, runtime.messages.size());
+        assertEquals(Collections.singletonList(BackupTrigger.EXIT), runtime.triggers);
+
+        runtime.exitRelease.countDown();
+        stopping.join(2000L);
+        assertFalse(stopping.isAlive());
+        assertFalse(coordinator.isBusy());
+        assertTrue(coordinator.request(server, BackupTrigger.WORLD_LOAD));
+        await(() -> !coordinator.isActive());
+        assertEquals(BackupTrigger.WORLD_LOAD,
+            runtime.triggers.get(runtime.triggers.size() - 1));
     }
 
     @Test
@@ -847,11 +890,14 @@ public class BackupCoordinatorTest {
         private final List<BackupTrigger> triggers = Collections.synchronizedList(new ArrayList<>());
         private final CountDownLatch backupEntered = new CountDownLatch(1);
         private final CountDownLatch backupRelease = new CountDownLatch(1);
+        private final CountDownLatch exitEntered = new CountDownLatch(1);
+        private final CountDownLatch exitRelease = new CountDownLatch(1);
         private final CountDownLatch stagingEntered = new CountDownLatch(1);
         private final CountDownLatch stagingRelease = new CountDownLatch(1);
         private final CountDownLatch prepareEntered = new CountDownLatch(1);
         private final CountDownLatch prepareRelease = new CountDownLatch(1);
         private volatile boolean blockBackup;
+        private volatile boolean blockExit;
         private volatile boolean blockUntilCancelled;
         private volatile boolean ignoreCancellationUntilReleased;
         private volatile boolean workerCleaned;
@@ -962,6 +1008,10 @@ public class BackupCoordinatorTest {
                                           BackupCancellation cancellation) throws Exception {
             triggers.add(job.trigger);
             events.add("backup-" + job.trigger);
+            if (job.trigger == BackupTrigger.EXIT && blockExit) {
+                exitEntered.countDown();
+                exitRelease.await();
+            }
             if (failBackup) throw new IOException("backup failed");
             if (job.trigger != BackupTrigger.EXIT) {
                 backupEntered.countDown();

@@ -28,11 +28,21 @@ public final class ClientEventHandler {
     private final KeyBinding manualBackup = new KeyBinding("key.worldbackup.manual",
         Keyboard.KEY_NONE, "key.categories.worldbackup");
     private final BackupTimer timer = new BackupTimer();
-    private final WorldLoadTimer worldLoadTimer = new WorldLoadTimer();
+    private final WorldLoadTickPolicy worldLoadPolicy = new WorldLoadTickPolicy();
+    private final BusyRequester worldLoadRequester;
     private final Map<GuiWorldSelection, GuiButton> managerButtons = new WeakHashMap<>();
 
     public ClientEventHandler(BackupCoordinator coordinator) {
         this.coordinator = coordinator;
+        this.worldLoadRequester = new BusyRequester() {
+            @Override public boolean isBusy() {
+                return coordinator.isBusy();
+            }
+
+            @Override public boolean request(Object server, BackupTrigger trigger) {
+                return coordinator.request(server, trigger);
+            }
+        };
         ClientRegistry.registerKeyBinding(manualBackup);
     }
 
@@ -50,11 +60,7 @@ public final class ClientEventHandler {
         boolean worldLoad = loaded && WorldBackupConfig.enabled
             && WorldBackupConfig.worldLoadEnabled;
         long now = System.nanoTime();
-        if (worldLoadTimer.due(worldLoad ? server : null, worldLoad, now)
-                && !coordinator.isBusy()
-                && coordinator.request(server, BackupTrigger.WORLD_LOAD)) {
-            worldLoadTimer.accepted(server);
-        }
+        worldLoadPolicy.tick(server, worldLoad, now, worldLoadRequester);
         boolean scheduled = loaded && WorldBackupConfig.enabled
             && WorldBackupConfig.scheduledEnabled;
         long interval = TimeUnit.MINUTES.toNanos(
@@ -197,6 +203,24 @@ public final class ClientEventHandler {
 
         void accepted(Object server) {
             if (armed && server == serverIdentity) accepted = true;
+        }
+    }
+
+    interface BusyRequester {
+        boolean isBusy();
+        boolean request(Object server, BackupTrigger trigger);
+    }
+
+    static final class WorldLoadTickPolicy {
+        private final WorldLoadTimer timer = new WorldLoadTimer();
+
+        boolean tick(Object server, boolean enabled, long now,
+                     BusyRequester requester) {
+            if (!timer.due(enabled ? server : null, enabled, now)
+                    || requester.isBusy()) return false;
+            if (!requester.request(server, BackupTrigger.WORLD_LOAD)) return false;
+            timer.accepted(server);
+            return true;
         }
     }
 
