@@ -16,7 +16,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:JAVA_HOME\jre\bin;$env:Path"
 .\gradlew.bat clean test build --offline --no-daemon --max-workers=1
 ```
 
-成品位于 `build/libs/worldbackup-1.0.0.jar`。
+当前开发版本为 1.0.1，成品位于 `build/libs/worldbackup-1.0.1.jar`；已发布的 1.0.0 标签与发布包保持原样。
 
 ## 配置
 
@@ -76,6 +76,18 @@ Forge 的 Mod Options 中可修改以下 9 项设置；默认配置适合直接�
 
 ## 一致性、限制与故障恢复
 
+### 1.0.1 快照性能改进
+
+1.0.1 减少了重复真实路径解析与目标文件属性查询，复制采用最大 8 MiB 的可取消 channel 传输，零进展时回退到 64 KiB 缓冲复制。保留复制前后身份/大小/修改时间检查、junction 拒绝、一致时间点快照及原有备份格式。
+
+本机 NTFS/NVMe 模拟数据交替对比中，8192 个小文件（128 MiB）的快照阶段中位数从 23.068 秒降至 14.330 秒，混合文件（544 MiB）从 6.285 秒降至 4.628 秒。16 个大文件（1 GiB）从 0.943 秒降至 0.886 秒，差异较小且范围重叠，不能据此保证大文件场景收益。它们不包含真实 Minecraft 保存/flush、线程调度和再次保存，不代表实机完整停顿或 FPS 改善。方法和全部数据见 [性能报告](docs/performance/2026-10-16-snapshot-results.md)。
+
+游戏日志增加以下阶段的毫秒计时，便于真实世界后续定位：`prepare-save-flush`（保存与刷新）、`Snapshot stage`（文件数、字节数、旧临时目录清理、扫描、复制及总耗时）、`release-save`（恢复保存）、`snapshot-cleanup`（清理快照）、`archive-transaction`（后台归档事务）。聊天栏仍只显示原有开始/完成消息和总耗时。
+
+旧临时目录的清理本次仍保留在现有 staging 生命周期中：正常无残留时的基准耗时不足数毫秒，提前清理需要扩展看门狗与停服所有权；本次收益来自已测量的重复查询优化。发生崩溃后存在大残留目录时，该清理仍可能增加停顿，日志可单独识别。
+
+### 共同限制与故障恢复
+
 - 为得到一致快照，模组会先保存并刷新世界，然后在 `<游戏目录>/.worldbackup-staging/` 复制一份临时快照。复制阶段短暂暂停世界保存并会临时占用接近一份世界大小的额外空间；复制完成后尽快恢复世界，压缩和校验在后台继续。
 - 单次备份的看门狗超时为 30 分钟。超时或取消会停止工作并尝试恢复保存状态、清理临时快照。
 - 索引读写上限为 64 MiB，超限索引会被拒绝。
@@ -91,7 +103,15 @@ Forge 的 Mod Options 中可修改以下 9 项设置；默认配置适合直接�
 
 ## 验证状态
 
-### Automated verified
+### Automated verified — 1.0.1
+
+- 2026-10-16：项目 Java 8 干净执行 `clean test build --offline --no-daemon --max-workers=1` 成功，包含重混淆 JAR。为修复本机缓存缺失，临时 init script 仅将构建工具指向本机已有的 Access Transformers 1.0.5；没有修改项目的 Forge 或 JUnit 版本，也没有将临时设置打包。
+- JUnit：17 个测试套件，307 项测试，0 failure，0 error，1 项既有平台条件跳过（Windows 无法创建特定非法文件名）。
+- 快照专项覆盖真实内部 junction、复制中父路径替换、内容/时间戳、空文件、开始前及分段传输后的取消清理、短传输和零进展回退；原有仓库、恢复、保留及停服测试通过。
+- `worldbackup-1.0.1.jar` 已核对版本为 1.0.1，包含双语资源、AT 和快照优化类，无测试类、邮箱或本机绝对路径。
+- 1.0.1 已安装到 BETA3，当前仅一份生效的 World Backup JAR。原 1.0.0 安装件保留为 `worldbackup-1.0.0.jar.bak-F3DAAC7E`；BETA4/BETA5 未改动。1.0.1 的真实游戏停顿仍需本地实测，模拟基准不能替代该验证。
+
+### Automated verified — 1.0.0 历史记录
 
 - 2026-10-14：使用项目内 Temurin OpenJDK `1.8.0_504` 执行 `clean test build --offline --no-daemon --max-workers=1` 成功。
 - JUnit：16 个测试套件，299 个测试，0 failure，0 error，1 个平台条件测试 skipped。

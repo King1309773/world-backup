@@ -13,12 +13,8 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.SimpleFileVisitor;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
@@ -86,6 +82,16 @@ public final class WorldSnapshotController {
 
     private Prepared prepareInitialized(SnapshotServer server,
                                         BackupCancellation cancellation) throws Exception {
+        long started = System.nanoTime();
+        try {
+            return prepareWorlds(server, cancellation);
+        } finally {
+            SnapshotTimings.phase("prepare-save-flush", started);
+        }
+    }
+
+    private Prepared prepareWorlds(SnapshotServer server,
+                                   BackupCancellation cancellation) throws Exception {
         Objects.requireNonNull(cancellation, "cancellation");
         checkPreparation(cancellation);
         List<SnapshotWorld> worlds = new ArrayList<>(server.worlds());
@@ -198,8 +204,13 @@ public final class WorldSnapshotController {
         Objects.requireNonNull(handle, "handle");
         synchronized (handle) {
             if (handle.snapshotClosed) return;
-            handle.staged.close();
-            handle.snapshotClosed = true;
+            long started = System.nanoTime();
+            try {
+                handle.staged.close();
+                handle.snapshotClosed = true;
+            } finally {
+                SnapshotTimings.phase("snapshot-cleanup", started);
+            }
         }
     }
 
@@ -212,6 +223,15 @@ public final class WorldSnapshotController {
     }
 
     private static void restoreWorldFlagsAndSave(Prepared handle) throws Exception {
+        long started = System.nanoTime();
+        try {
+            restoreWorldFlagsAndSaveMeasured(handle);
+        } finally {
+            SnapshotTimings.phase("release-save", started);
+        }
+    }
+
+    private static void restoreWorldFlagsAndSaveMeasured(Prepared handle) throws Exception {
         Exception failure = null;
         for (WorldState state : handle.states) {
             try {
@@ -259,6 +279,10 @@ public final class WorldSnapshotController {
         public Path getSourceWorldDirectory() {
             return prepared.sourceWorldDirectory;
         }
+
+        public SnapshotMetrics getMetrics() {
+            return staged.metrics();
+        }
     }
 
     public static final class Prepared {
@@ -293,6 +317,7 @@ public final class WorldSnapshotController {
 
     interface StagedSnapshot extends AutoCloseable {
         Path root();
+        default SnapshotMetrics metrics() { return SnapshotMetrics.EMPTY; }
         @Override void close() throws Exception;
     }
 
@@ -449,6 +474,7 @@ public final class WorldSnapshotController {
         @Override public StagedSnapshot stage(Path source,
                                               BackupCancellation cancellation)
                 throws IOException {
+            long started = System.nanoTime();
             Objects.requireNonNull(cancellation, "cancellation").check();
             Path absolute = Objects.requireNonNull(source, "source")
                 .toAbsolutePath().normalize();
@@ -469,8 +495,12 @@ public final class WorldSnapshotController {
                     || resolvedSource.startsWith(resolvedBase)) {
                 throw new IOException("Snapshot staging directory overlaps active world");
             }
+            long housekeepingStarted = System.nanoTime();
             sweepOrphans(resolvedBase, cancellation);
+            long housekeepingNanos = System.nanoTime() - housekeepingStarted;
+            long scanStarted = System.nanoTime();
             SnapshotPlan plan = inspectTree(resolvedSource, cancellation);
+            long scanNanos = System.nanoTime() - scanStarted;
             long bytes = plan.totalBytes;
             long headroom = Math.max(MINIMUM_HEADROOM, bytes / 20L);
             long required = saturatedAdd(bytes, headroom);
@@ -480,9 +510,15 @@ public final class WorldSnapshotController {
             Path staged = Files.createTempDirectory(resolvedBase, "snapshot-")
                 .toAbsolutePath().normalize();
             try {
+                long copyStarted = System.nanoTime();
                 copyTree(resolvedSource, staged, plan, copier, cancellation);
+                long copyNanos = System.nanoTime() - copyStarted;
                 cancellation.check();
-                return new NioStagedSnapshot(staged);
+                SnapshotMetrics metrics = new SnapshotMetrics(
+                    plan.files.size(), bytes, housekeepingNanos, scanNanos,
+                    copyNanos, System.nanoTime() - started);
+                SnapshotTimings.staged(metrics);
+                return new NioStagedSnapshot(staged, metrics);
             } catch (IOException | RuntimeException failure) {
                 try {
                     deleteTree(staged);
@@ -571,8 +607,10 @@ public final class WorldSnapshotController {
                 copier.copy(file, destination, cancellation);
                 cancellation.check();
                 entry.verifyFile(source, file);
-                if (!Files.isRegularFile(destination, LinkOption.NOFOLLOW_LINKS)
-                        || Files.size(destination) != entry.size) {
+                BasicFileAttributes destinationAttributes = Files.readAttributes(
+                    destination, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (!destinationAttributes.isRegularFile()
+                        || destinationAttributes.size() != entry.size) {
                     throw new IOException("Incomplete world snapshot copy: " + file);
                 }
             }
@@ -581,20 +619,7 @@ public final class WorldSnapshotController {
         private static void copyFile(Path source, Path target,
                                      BackupCancellation cancellation)
                 throws IOException {
-            byte[] buffer = new byte[64 * 1024];
-            try (InputStream input = Files.newInputStream(source, StandardOpenOption.READ,
-                    LinkOption.NOFOLLOW_LINKS);
-                 OutputStream output = Files.newOutputStream(target,
-                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
-                    LinkOption.NOFOLLOW_LINKS)) {
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    cancellation.check();
-                    output.write(buffer, 0, count);
-                }
-            }
-            Files.setLastModifiedTime(target, Files.getLastModifiedTime(source,
-                LinkOption.NOFOLLOW_LINKS));
+            SnapshotFileCopier.copy(source, target, cancellation);
         }
 
         private static void sweepOrphans(Path base, BackupCancellation cancellation)
@@ -644,8 +669,12 @@ public final class WorldSnapshotController {
         private static void requireContainedRealPath(Path source, Path path)
                 throws IOException {
             Path followed = path.toRealPath();
-            Path notFollowed = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
-            if (!followed.startsWith(source) || !followed.equals(notFollowed)) {
+            // source is canonical and children come from walkFileTree or source.resolve.
+            // Their absolute lexical spelling is already rooted in that canonical tree.
+            // Comparing it with the followed path detects ancestor junction replacements
+            // without repeating an expensive component-by-component NOFOLLOW realpath.
+            Path expected = path.toAbsolutePath().normalize();
+            if (!followed.startsWith(source) || !followed.equals(expected)) {
                 throw new IOException("World snapshot entry escapes source: " + path);
             }
         }
@@ -730,9 +759,14 @@ public final class WorldSnapshotController {
 
     private static final class NioStagedSnapshot implements StagedSnapshot {
         private final Path root;
+        private final SnapshotMetrics metrics;
 
-        private NioStagedSnapshot(Path root) { this.root = root; }
+        private NioStagedSnapshot(Path root, SnapshotMetrics metrics) {
+            this.root = root;
+            this.metrics = metrics;
+        }
         @Override public Path root() { return root; }
+        @Override public SnapshotMetrics metrics() { return metrics; }
         @Override public void close() throws IOException { deleteTree(root); }
     }
 

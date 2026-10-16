@@ -684,7 +684,10 @@ public class BackupCoordinatorTest {
                 @Override public void succeeded(String result) { callback.set(true); }
                 @Override public void failed(Throwable failure) { throw new AssertionError(failure); }
             }));
-        await(() -> runtime.clientScheduleAttempts > 0);
+        // Await the whole worker action, not an increment immediately before the
+        // scheduler throws and before the retry callback is actually enqueued.
+        executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+        assertEquals(1, runtime.clientScheduleAttempts);
         assertTrue(coordinator.isBusy());
         assertFalse(callback.get());
 

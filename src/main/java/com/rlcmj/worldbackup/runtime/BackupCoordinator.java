@@ -912,9 +912,14 @@ public final class BackupCoordinator {
         }
         @Override public BackupResult run(BackupJob job, BackupCancellation cancellation)
                 throws Exception {
-            return repository.createBackup(job.worldRoot, job.repository, job.worldId,
-                job.displayName, job.mode, job.trigger, job.maxVersions,
-                job.incrementsPerBase, job.startedAtMillis, cancellation);
+            long started = System.nanoTime();
+            try {
+                return repository.createBackup(job.worldRoot, job.repository, job.worldId,
+                    job.displayName, job.mode, job.trigger, job.maxVersions,
+                    job.incrementsPerBase, job.startedAtMillis, cancellation);
+            } finally {
+                SnapshotTimings.phase("archive-transaction", started);
+            }
         }
         @Override public void schedule(Object server, Runnable command) {
             ((MinecraftServer) server).addScheduledTask(command);
