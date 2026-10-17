@@ -16,7 +16,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:JAVA_HOME\jre\bin;$env:Path"
 .\gradlew.bat clean test build --offline --no-daemon --max-workers=1
 ```
 
-当前开发版本为 1.0.1，成品位于 `build/libs/worldbackup-1.0.1.jar`；已发布的 1.0.0 标签与发布包保持原样。
+当前版本为 1.0.1，构建成品位于 `build/libs/worldbackup-1.0.1.jar`。正式下载见 [GitHub Releases](https://github.com/King1309773/world-backup/releases)，发布说明见 [v1.0.1](releases/v1.0.1/更新日志.md)；1.0.0 标签与发布包保持原样。
 
 ## 配置
 
